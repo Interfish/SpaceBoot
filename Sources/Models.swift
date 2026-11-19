@@ -10,15 +10,25 @@ enum SpaceBootConfig {
 
     static let minimumWindowWidth: Double = 150
     static let minimumWindowHeight: Double = 150
+    static let largeTargetMinWidth = 500
+    static let largeTargetMinHeight = 400
+    static let splashFilterMinWidth = 450
+    static let splashFilterMinHeight = 350
     static let normalWindowLayer = 0
     static let desktopSpaceType = 0
 
     static let spaceSwitchTimeoutSeconds: TimeInterval = 2.0
     static let spaceSwitchPollMicros: useconds_t = 80_000
     static let spaceAnimationSettleMicros: useconds_t = 400_000
-    static let launchWindowTimeoutSeconds: TimeInterval = 10.0
+    static let launchWindowTimeoutSeconds: TimeInterval = 12.0
+    static let splashExtendedTimeoutSeconds: TimeInterval = 30.0
     static let launchPollMicros: useconds_t = 300_000
+    static let frameVerifyTolerancePx = 24
+    static let frameApplyMaxAttempts = 5
+    static let frameVerifyDelayMicros: useconds_t = 220_000
+    static let replacementWatchDelayMicros: useconds_t = 900_000
     static let raiseWindowDelayMicros: useconds_t = 70_000
+    static let lateArrivalWatchSeconds: TimeInterval = 60.0
 
     /// System/helper processes excluded from recorded layouts.
     static let ignoredBundleIds: Set<String> = [
@@ -41,13 +51,14 @@ enum SpaceBootConfig {
         "org.mozilla.FlowerBrowser"
     ]
 
-    /// Resolves the Cursor CLI binary across common installation locations.
+    /// Resolves the Cursor CLI binary across common installation locations,
+    /// preferring the app bundle binary so GUI launches do not depend on shell $PATH shims.
     static func resolveCursorCliPath() -> String? {
         let candidates = [
-            "\(NSHomeDirectory())/.local/bin/cursor",
-            "/usr/local/bin/cursor",
+            "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
             "/opt/homebrew/bin/cursor",
-            "/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+            "/usr/local/bin/cursor",
+            "\(NSHomeDirectory())/.local/bin/cursor"
         ]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
@@ -60,6 +71,13 @@ struct WindowRect: Codable, Equatable {
     var y: Int
     var width: Int
     var height: Int
+
+    func isApproximatelyEqual(to other: WindowRect, tolerance: Int) -> Bool {
+        abs(x - other.x) <= tolerance &&
+        abs(y - other.y) <= tolerance &&
+        abs(width - other.width) <= tolerance &&
+        abs(height - other.height) <= tolerance
+    }
 }
 
 struct LaunchConfig: Codable, Equatable {
@@ -127,6 +145,19 @@ struct LiveDisplayInfo {
     }
 }
 
+struct AXWindowMeta {
+    let role: String
+    let subrole: String
+    let title: String
+    let isSizeSettable: Bool
+    let isPositionSettable: Bool
+    let isMinimized: Bool
+
+    var isStandardMainWindow: Bool {
+        role == "AXWindow" && subrole == "AXStandardWindow" && !isMinimized
+    }
+}
+
 struct LiveWindowInfo {
     let windowId: Int
     let pid: pid_t
@@ -136,4 +167,5 @@ struct LiveWindowInfo {
     let frame: WindowRect
     let spaceIds: [Int]
     let zIndex: Int
+    let isOnscreen: Bool
 }

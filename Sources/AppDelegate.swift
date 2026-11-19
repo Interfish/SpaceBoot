@@ -17,6 +17,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
+
+        SpaceBootLogger.log("SpaceBoot launched. AXIsProcessTrusted=\(AXIsProcessTrusted())")
+        registerDistributedCommands()
+    }
+
+    // MARK: - Distributed Notification IPC (for CLI / automation triggers)
+
+    private func registerDistributedCommands() {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleDistributedCommand(_:)),
+            name: Notification.Name("com.spaceboot.command"),
+            object: nil
+        )
+    }
+
+    @objc private func handleDistributedCommand(_ notification: Notification) {
+        guard let payload = notification.object as? String else { return }
+        let parts = payload.split(separator: ":", maxSplits: 1).map(String.init)
+        let action = parts[0]
+        let profileName = parts.count > 1 ? parts[1] : ""
+
+        SpaceBootLogger.log("IPC command received: action=\(action) profile=\(profileName)")
+
+        switch action {
+        case "inspect":
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.profileManager.dumpDiagnostics()
+            }
+        case "record":
+            guard !profileName.isEmpty else { return }
+            performRecord(named: profileName)
+        case "boot":
+            guard !profileName.isEmpty else { return }
+            performApply(named: profileName, launchMissing: true, silentErrors: true)
+        case "restore":
+            guard !profileName.isEmpty else { return }
+            performApply(named: profileName, launchMissing: false, silentErrors: true)
+        default:
+            break
+        }
     }
 
     // MARK: - NSMenuDelegate
@@ -131,6 +172,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         openDirItem.target = self
         menu.addItem(openDirItem)
 
+        let openLogItem = NSMenuItem(title: "Open Log File", action: #selector(handleOpenLogFile), keyEquivalent: "")
+        openLogItem.target = self
+        menu.addItem(openLogItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit SpaceBoot", action: #selector(handleQuit), keyEquivalent: "q")
@@ -167,12 +212,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func handleLaunchProfile(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
-        performApply(named: name, launchMissing: true)
+        performApply(named: name, launchMissing: true, silentErrors: false)
     }
 
     @objc private func handleRepositionProfile(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
-        performApply(named: name, launchMissing: false)
+        performApply(named: name, launchMissing: false, silentErrors: false)
     }
 
     @objc private func handleRevealProfile(_ sender: NSMenuItem) {
@@ -236,6 +281,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    @objc private func handleOpenLogFile() {
+        let url = URL(fileURLWithPath: SpaceBootLogger.logFilePath)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            SpaceBootLogger.log("Log opened.")
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     @objc private func handleQuit() {
         NSApplication.shared.terminate(nil)
     }
@@ -253,15 +306,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 body: "\"\(profile.name)\" saved \(profile.totalWindowCount) windows — \(detail)"
             )
         } catch {
+            SpaceBootLogger.log("Record error: \(error.localizedDescription)")
             showErrorAlert(title: "Record Failed", message: error.localizedDescription)
         }
     }
 
-    private func performApply(named name: String, launchMissing: Bool) {
+    private func performApply(named name: String, launchMissing: Bool, silentErrors: Bool) {
         guard let profile = profileManager.loadProfile(named: name) else { return }
         if !AXIsProcessTrusted() {
-            handleRequestAccessibility()
-            showErrorAlert(title: "Accessibility Required", message: ProfileActionError.missingAccessibility.localizedDescription)
+            SpaceBootLogger.log("Apply aborted: AXIsProcessTrusted is false")
+            if !silentErrors {
+                handleRequestAccessibility()
+                showAccessibilityAlert()
+            }
             return
         }
 
@@ -278,9 +335,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     )
                 }
             } catch {
+                SpaceBootLogger.log("Apply error: \(error.localizedDescription)")
                 DispatchQueue.main.async {
                     self.setBusy(false)
-                    self.showErrorAlert(title: "Unable to Boot \"\(profile.name)\"", message: error.localizedDescription)
+                    if !silentErrors {
+                        self.showErrorAlert(title: "Unable to Boot \"\(profile.name)\"", message: error.localizedDescription)
+                    }
                 }
             }
         }
@@ -300,6 +360,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.title = ""
         } else {
             button.title = busy ? "…" : "SB"
+        }
+    }
+
+    private func showAccessibilityAlert() {
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Accessibility Required"
+        alert.informativeText = ProfileActionError.missingAccessibility.localizedDescription
+        alert.addButton(withTitle: "Open Accessibility Settings")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
     }
 

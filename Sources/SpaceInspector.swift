@@ -72,6 +72,7 @@ final class SpaceInspector {
             return []
         }
 
+        let activeSpaceIds = Set(listDisplays().map { $0.currentSpaceId })
         let pidToBundleId = buildPidBundleIdMap()
         var windows: [LiveWindowInfo] = []
         var zOrder = 0
@@ -85,6 +86,7 @@ final class SpaceInspector {
             let appId = pidToBundleId[pid] ?? ""
             let appName = entry[kCGWindowOwnerName as String] as? String ?? ""
             let title = entry[kCGWindowName as String] as? String ?? ""
+            let isOnscreen = (entry[kCGWindowIsOnscreen as String] as? Bool) ?? false
             let bounds = entry[kCGWindowBounds as String] as? [String: Any] ?? [:]
 
             let frame = WindowRect(
@@ -98,6 +100,12 @@ final class SpaceInspector {
             let spaceIds = copyWinSpaces(connectionId, 0x7, [wid] as CFArray) as? [Int] ?? []
             guard !spaceIds.isEmpty else { continue }
 
+            // Drop hidden/ghost windows parked on a currently active Space (e.g., WeChat's hidden 280x380 panel).
+            let onActiveSpace = spaceIds.contains(where: { activeSpaceIds.contains($0) })
+            if onActiveSpace && !isOnscreen {
+                continue
+            }
+
             windows.append(LiveWindowInfo(
                 windowId: wid,
                 pid: pid,
@@ -106,7 +114,8 @@ final class SpaceInspector {
                 title: title,
                 frame: frame,
                 spaceIds: spaceIds,
-                zIndex: zOrder
+                zIndex: zOrder,
+                isOnscreen: isOnscreen
             ))
             zOrder += 1
         }
