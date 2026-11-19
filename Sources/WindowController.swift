@@ -18,6 +18,35 @@ final class WindowController {
 
     // MARK: - AX Window Introspection
 
+    /// Reads the window's logical position and size directly via Accessibility (unaffected by Mission Control thumbnail scaling).
+    func readAXWindowFrame(windowId: Int, pid: pid_t) -> WindowRect? {
+        guard AXIsProcessTrusted(), let axWindow = findAXWindow(windowId: windowId, pid: pid) else {
+            return nil
+        }
+
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posAX = posRef, let sizeAX = sizeRef else {
+            return nil
+        }
+
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posAX as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(sizeAX as! AXValue, .cgSize, &size) else {
+            return nil
+        }
+
+        return WindowRect(
+            x: Int(origin.x.rounded()),
+            y: Int(origin.y.rounded()),
+            width: Int(size.width.rounded()),
+            height: Int(size.height.rounded())
+        )
+    }
+
     /// Reads Accessibility metadata for a window. Returns nil if inaccessible (e.g., off-Space window
     /// that an app only exposes while on screen, or missing Accessibility permission).
     func inspectAXWindow(windowId: Int, pid: pid_t) -> AXWindowMeta? {
@@ -195,7 +224,29 @@ final class WindowController {
             .first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId
     }
 
-    /// Switches directly to a 0-based global desktop index across connected displays (used by ⌥1–⌥9 hotkeys).
+    /// Switches Space `localIndex` (0-based) on whichever display currently contains the mouse cursor.
+    @discardableResult
+    func switchActiveDisplay(toSpaceIndex localIndex: Int) -> Bool {
+        let displays = inspector.listDisplays()
+        guard !displays.isEmpty else { return false }
+
+        let targetDisplay: LiveDisplayInfo
+        if let cursorLocation = CGEvent(source: nil)?.location,
+           let underCursor = displays.first(where: { $0.cgFrame.contains(cursorLocation) }) {
+            targetDisplay = underCursor
+        } else {
+            targetDisplay = displays[0]
+        }
+
+        guard localIndex >= 0, localIndex < targetDisplay.desktopSpaceIds.count else {
+            SpaceBootLogger.log("switchActiveDisplay \(targetDisplay.name) has only \(targetDisplay.desktopSpaceIds.count) space(s); ignoring index \(localIndex)")
+            return false
+        }
+
+        return switchDisplay(targetDisplay.uuid, toSpaceIndex: localIndex, settleForLaunch: false)
+    }
+
+    /// Switches directly to a 0-based global desktop index across connected displays.
     @discardableResult
     func switchToGlobalDesktop(index globalIndex: Int) -> Bool {
         let displays = inspector.listDisplays()
@@ -211,9 +262,13 @@ final class WindowController {
         return false
     }
 
-    /// Moves pointer and transfers active-display focus to `display` so Space navigation and new windows target it.
+    /// Transfers active-display focus to `display` so Space navigation and new windows target it.
+    /// Avoids warping the user's cursor if it is already inside `display`.
     func focusDisplay(_ display: LiveDisplayInfo) {
-        moveMouse(to: display.cgCenter)
+        let cursorAlreadyOnDisplay = CGEvent(source: nil).map { display.cgFrame.contains($0.location) } ?? false
+        if !cursorAlreadyOnDisplay {
+            moveMouse(to: display.cgCenter)
+        }
 
         let windowsOnCurrentSpace = inspector.listAllUserWindows().filter {
             $0.spaceIds.contains(display.currentSpaceId)

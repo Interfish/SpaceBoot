@@ -561,15 +561,17 @@ final class ProfileManager {
                     }
 
                     // Case A: Original window ID is still alive — check for async drift.
+                    // Prefer AX logical bounds over CG bounds so Mission Control thumbnail scaling never causes false drift.
                     if let live = liveWindows.first(where: { $0.windowId == entry.windowId }) {
-                        let frameOk = live.frame.isApproximatelyEqual(
+                        let logicalFrame = self.controller.readAXWindowFrame(windowId: entry.windowId, pid: entry.pid) ?? live.frame
+                        let frameOk = logicalFrame.isApproximatelyEqual(
                             to: entry.expectedFrame,
                             tolerance: SpaceBootConfig.frameVerifyTolerancePx
                         )
                         let spaceOk = live.spaceIds.contains(entry.targetSpaceId)
 
                         if !frameOk || !spaceOk {
-                            SpaceBootLogger.log("SettleGuard drift on wid=\(entry.windowId) (\(entry.appName)): got \(live.frame) sp=\(live.spaceIds), restoring -> \(entry.expectedFrame) sp=\(entry.targetSpaceId)")
+                            SpaceBootLogger.log("SettleGuard drift on wid=\(entry.windowId) (\(entry.appName)): got \(logicalFrame) sp=\(live.spaceIds), restoring -> \(entry.expectedFrame) sp=\(entry.targetSpaceId)")
                             _ = self.controller.setWindowFrameVerified(
                                 windowId: entry.windowId,
                                 pid: entry.pid,

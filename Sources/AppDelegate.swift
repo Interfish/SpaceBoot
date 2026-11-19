@@ -4,6 +4,7 @@ import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let hotKeysPrefKey = "SpaceBootGlobalHotKeysEnabled"
+    private static let globalScopePrefKey = "SpaceBootHotKeyGlobalScope"
 
     private let inspector = SpaceInspector()
     private lazy var controller = WindowController(inspector: inspector)
@@ -25,6 +26,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set {
             UserDefaults.standard.set(newValue, forKey: Self.hotKeysPrefKey)
         }
+    }
+
+    /// false (default): ⌥1..⌥9 switch Spaces 1..9 on the display under the mouse cursor.
+    /// true: ⌥1..⌥9 switch global Desktop 1..9 sequentially across all displays.
+    private var useGlobalDesktopScope: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.globalScopePrefKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.globalScopePrefKey) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -60,19 +68,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !isBusy else { return }
 
         switch action {
-        case .switchDesktop(let globalIndex):
+        case .switchDesktop(let index):
             guard !isSwitchingSpace else { return }
             isSwitchingSpace = true
+            let useGlobal = useGlobalDesktopScope
             interactiveSwitchQueue.async { [weak self] in
                 defer {
                     DispatchQueue.main.async { self?.isSwitchingSpace = false }
                 }
                 guard let self = self else { return }
                 if !AXIsProcessTrusted() {
-                    SpaceBootLogger.log("Hotkey ⌥\(globalIndex + 1) ignored: AXIsProcessTrusted is false")
+                    SpaceBootLogger.log("Hotkey ⌥\(index + 1) ignored: AXIsProcessTrusted is false")
                     return
                 }
-                _ = self.controller.switchToGlobalDesktop(index: globalIndex)
+                if useGlobal {
+                    _ = self.controller.switchToGlobalDesktop(index: index)
+                } else {
+                    _ = self.controller.switchActiveDisplay(toSpaceIndex: index)
+                }
             }
 
         case .bootMatchingProfile:
@@ -159,16 +172,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for (localIdx, spaceId) in d.desktopSpaceIds.enumerated() {
                     let isCurrent = (spaceId == d.currentSpaceId)
                     let marker = isCurrent ? "●" : "○"
-                    let keyHint = (hotKeysEnabled && globalDesktopNumber <= 9) ? "\(globalDesktopNumber)" : ""
+                    let displayNumber = useGlobalDesktopScope ? globalDesktopNumber : (localIdx + 1)
+                    let keyHint = (hotKeysEnabled && displayNumber <= 9) ? "\(displayNumber)" : ""
+                    let title = useGlobalDesktopScope
+                        ? "    \(marker) Desktop \(globalDesktopNumber) (Space \(localIdx + 1))"
+                        : "    \(marker) Space \(localIdx + 1)"
                     let item = NSMenuItem(
-                        title: "    \(marker) Desktop \(globalDesktopNumber) (Space \(localIdx + 1))",
+                        title: title,
                         action: #selector(handleSwitchDesktopMenu(_:)),
                         keyEquivalent: keyHint
                     )
                     if !keyHint.isEmpty {
                         item.keyEquivalentModifierMask = .option
                     }
-                    item.tag = globalDesktopNumber - 1
+                    item.representedObject = (d.uuid, localIdx)
                     item.target = self
                     item.isEnabled = !isBusy
                     menu.addItem(item)
@@ -252,6 +269,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hotKeyToggle.state = hotKeysEnabled ? .on : .off
         menu.addItem(hotKeyToggle)
 
+        if hotKeysEnabled {
+            let scopeTitle = useGlobalDesktopScope
+                ? "  Scope: All Displays (Global Desktop 1–9)"
+                : "  Scope: Display Under Mouse (Space 1–9)"
+            let scopeItem = NSMenuItem(
+                title: scopeTitle,
+                action: #selector(handleToggleHotKeyScope),
+                keyEquivalent: ""
+            )
+            scopeItem.target = self
+            menu.addItem(scopeItem)
+        }
+
         menu.addItem(.separator())
 
         if !AXIsProcessTrusted() {
@@ -282,12 +312,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
 
     @objc private func handleSwitchDesktopMenu(_ sender: NSMenuItem) {
-        handleHotKeyAction(.switchDesktop(globalIndex: sender.tag))
+        guard !isBusy, !isSwitchingSpace,
+              let target = sender.representedObject as? (String, Int) else { return }
+        isSwitchingSpace = true
+        interactiveSwitchQueue.async { [weak self] in
+            defer { DispatchQueue.main.async { self?.isSwitchingSpace = false } }
+            _ = self?.controller.switchDisplay(target.0, toSpaceIndex: target.1, settleForLaunch: false)
+        }
     }
 
     @objc private func handleToggleHotKeys() {
         hotKeysEnabled.toggle()
         syncHotKeysState()
+    }
+
+    @objc private func handleToggleHotKeyScope() {
+        useGlobalDesktopScope.toggle()
     }
 
     @objc private func handleNewProfile() {
