@@ -224,29 +224,7 @@ final class WindowController {
             .first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId
     }
 
-    /// Switches Space `localIndex` (0-based) on whichever display currently contains the mouse cursor.
-    @discardableResult
-    func switchActiveDisplay(toSpaceIndex localIndex: Int) -> Bool {
-        let displays = inspector.listDisplays()
-        guard !displays.isEmpty else { return false }
-
-        let targetDisplay: LiveDisplayInfo
-        if let cursorLocation = CGEvent(source: nil)?.location,
-           let underCursor = displays.first(where: { $0.cgFrame.contains(cursorLocation) }) {
-            targetDisplay = underCursor
-        } else {
-            targetDisplay = displays[0]
-        }
-
-        guard localIndex >= 0, localIndex < targetDisplay.desktopSpaceIds.count else {
-            SpaceBootLogger.log("switchActiveDisplay \(targetDisplay.name) has only \(targetDisplay.desktopSpaceIds.count) space(s); ignoring index \(localIndex)")
-            return false
-        }
-
-        return switchDisplay(targetDisplay.uuid, toSpaceIndex: localIndex, settleForLaunch: false)
-    }
-
-    /// Switches directly to a 0-based global desktop index across connected displays.
+    /// Switches directly to a 0-based global desktop index sequentially across connected displays.
     @discardableResult
     func switchToGlobalDesktop(index globalIndex: Int) -> Bool {
         let displays = inspector.listDisplays()
