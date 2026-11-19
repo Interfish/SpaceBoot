@@ -6,6 +6,7 @@ enum ProfileActionError: LocalizedError {
     case missingAccessibility
     case missingDisplays([String])
     case insufficientSpaces([(displayName: String, current: Int, required: Int)])
+    case spaceShortcutsDisabled
 
     var errorDescription: String? {
         switch self {
@@ -18,6 +19,8 @@ enum ProfileActionError: LocalizedError {
         case .insufficientSpaces(let items):
             let details = items.map { "\($0.displayName): has \($0.current) desktop(s), profile requires \($0.required)" }
             return "Not enough Desktop Spaces:\n" + details.joined(separator: "\n") + "\n\nAdd the missing Desktop Spaces in Mission Control and try again."
+        case .spaceShortcutsDisabled:
+            return "Mission Control Space-switching shortcuts are disabled. Enable \"Move left a space\" / \"Move right a space\" (or \"Switch to Desktop N\") in System Settings → Keyboard Shortcuts → Mission Control."
         }
     }
 }
@@ -30,10 +33,11 @@ private struct PendingLateWindow {
     let existingIdsAtLaunch: Set<Int>
 }
 
-/// Handles profile persistence, instant multi-Space recording, and sequential Space boot/restoration.
+/// Handles profile persistence, instant multi-Space recording, and universal Space boot/restoration.
 final class ProfileManager {
     private let inspector: SpaceInspector
     private let controller: WindowController
+    private let launcher = AppLauncher()
 
     init(inspector: SpaceInspector, controller: WindowController) {
         self.inspector = inspector
@@ -98,8 +102,7 @@ final class ProfileManager {
             guard let matchedSpace = win.spaceIds.compactMap({ spaceLookup[$0] }).first else {
                 continue
             }
-            // Filter out splash screens, dialogs, and tiny auxiliary helper windows (e.g., WeChat 280x380 panel).
-            guard controller.isLikelyMainWindow(win) else {
+            guard controller.isRecordableWindow(win) else {
                 continue
             }
             buckets[matchedSpace.displayIdx][matchedSpace.spaceIdx, default: []].append(win)
@@ -208,8 +211,22 @@ final class ProfileManager {
             throw ProfileActionError.insufficientSpaces(insufficient)
         }
 
-        // Pre-claim windows that already sit on their exact target Spaces so cross-display borrowing never steals them.
+        // Verify at least one Space-switching method is available if multi-Space navigation is needed.
+        let needsSpaceSwitch = displayPairs.contains { pair in
+            pair.saved.spaces.filter { !$0.windows.isEmpty }.count > 1 ||
+            pair.saved.spaces.contains { !$0.windows.isEmpty && $0.spaceIndex != (pair.live.currentSpaceIndex ?? -1) }
+        }
+        if needsSpaceSwitch {
+            let hotKeys = SymbolicHotKeys()
+            let hasStepShortcuts = hotKeys.moveLeftShortcut() != nil && hotKeys.moveRightShortcut() != nil
+            let hasAnyDirect = (0..<16).contains { hotKeys.directDesktopShortcut(globalIndex: $0) != nil }
+            if !hasStepShortcuts && !hasAnyDirect {
+                throw ProfileActionError.spaceShortcutsDisabled
+            }
+        }
+
         var claimedWindowIds = preClaimCorrectlyPlacedWindows(displayPairs: displayPairs)
+        let neededBySpaceAndApp = buildNeededWindowCounts(displayPairs: displayPairs)
         var matchedCount = 0
         let totalCount = profile.totalWindowCount
         var pendingLateWindows: [PendingLateWindow] = []
@@ -217,8 +234,7 @@ final class ProfileManager {
         for pair in displayPairs {
             let liveUUID = pair.live.uuid
 
-            // Process activeSpaceIndex LAST so the display naturally finishes on the user's primary working Space
-            // (and any slow auth/loading app on that Space stays right in view while settling).
+            // Process activeSpaceIndex LAST so the display naturally finishes on the user's primary working Space.
             let nonEmptySpaces = pair.saved.spaces.filter { !$0.windows.isEmpty }
             let orderedSpaces = nonEmptySpaces.sorted { lhs, rhs in
                 if lhs.spaceIndex == pair.saved.activeSpaceIndex { return false }
@@ -242,9 +258,7 @@ final class ProfileManager {
                 var assignments = matchWindowsOnSpace(saved: savedSpace.windows, live: windowsOnSpace)
                 for win in assignments.values { claimedWindowIds.insert(win.windowId) }
 
-                // Borrow only SURPLUS unclaimed windows of the same app sitting on another currently-visible Space
-                // (never steal a window from another Space that still needs it).
-                let neededBySpaceAndApp = buildNeededWindowCounts(displayPairs: displayPairs)
+                // Borrow only SURPLUS unclaimed windows of the same app sitting on another currently-visible Space.
                 for (idx, savedWin) in savedSpace.windows.enumerated() where assignments[idx] == nil {
                     if let stray = allLive.first(where: { win in
                         guard !claimedWindowIds.contains(win.windowId),
@@ -270,9 +284,26 @@ final class ProfileManager {
                 if launchMissing {
                     for (idx, savedWin) in savedSpace.windows.enumerated() where assignments[idx] == nil {
                         guard let launch = savedWin.launch else { continue }
-                        let existingIds = Set(inspector.listAllUserWindows().map { $0.windowId })
-                        SpaceBootLogger.log("Launching \(savedWin.appName) (\(launch.kind)) for \(pair.saved.displayName) space[\(savedSpace.spaceIndex)]")
-                        triggerLaunch(launch)
+                        let currentAll = inspector.listAllUserWindows()
+                        let existingIds = Set(currentAll.map { $0.windowId })
+                        let appAlreadyHasWindow = currentAll.contains { $0.appId == savedWin.appId }
+
+                        SpaceBootLogger.log("Launching \(savedWin.appName) (kind=\(launch.kind), hasWindow=\(appAlreadyHasWindow)) for \(pair.saved.displayName) space[\(savedSpace.spaceIndex)]")
+                        let outcome = launcher.launchWindow(
+                            appId: savedWin.appId,
+                            spec: launch,
+                            appAlreadyHasWindow: appAlreadyHasWindow
+                        )
+
+                        switch outcome {
+                        case .singleWindowAlreadyOpen:
+                            continue
+                        case .failed(let reason):
+                            SpaceBootLogger.log("Launch failed for \(savedWin.appName): \(reason)")
+                            continue
+                        case .triggered:
+                            break
+                        }
 
                         if let result = waitForMainWindow(
                             appId: savedWin.appId,
@@ -282,14 +313,12 @@ final class ProfileManager {
                             let newWin = result.window
                             assignments[idx] = newWin
                             claimedWindowIds.insert(newWin.windowId)
-                            // Immediately move & size it while this Space is active (crucial when Chrome opens on Retina!).
                             _ = controller.setWindowFrameVerified(
                                 windowId: newWin.windowId,
                                 pid: newWin.pid,
                                 frame: savedWin.frame,
                                 targetSpaceId: targetSpaceId
                             )
-                            // Only wait for window replacement if the app had a splash transition or closed immediately.
                             if result.sawSplash,
                                let replaced = watchForWindowReplacement(
                                    original: newWin,
@@ -334,12 +363,10 @@ final class ProfileManager {
                 }
             }
 
-            // Ensure display ends on its recorded active Space.
             let finalIndex = min(pair.saved.activeSpaceIndex, max(0, pair.live.desktopSpaceIds.count - 1))
             _ = controller.switchDisplay(liveUUID, toSpaceIndex: finalIndex)
         }
 
-        // Start a non-blocking background watcher for slow-loading auth apps (e.g., Prisma Access Browser).
         if !pendingLateWindows.isEmpty {
             watchPendingLateWindows(pendingLateWindows)
         }
@@ -349,6 +376,26 @@ final class ProfileManager {
     }
 
     // MARK: - Private Helpers
+
+    /// Determines a generic launch config purely from standard macOS bundle location (zero vendor hardcoding).
+    private func defaultLaunchConfig(for win: LiveWindowInfo) -> LaunchConfig? {
+        if let app = NSRunningApplication(processIdentifier: win.pid),
+           let bundleURL = app.bundleURL {
+            guard SpaceBootConfig.isStandaloneApplicationPath(bundleURL.path) else {
+                SpaceBootLogger.log("Record: skipping standalone launch for host-managed bundle \(bundleURL.path)")
+                return nil
+            }
+            return LaunchConfig(kind: "app", target: bundleURL.path, url: nil)
+        }
+
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: win.appId) {
+            guard SpaceBootConfig.isStandaloneApplicationPath(appURL.path) else {
+                return nil
+            }
+            return LaunchConfig(kind: "app", target: appURL.path, url: nil)
+        }
+        return nil
+    }
 
     private func buildNeededWindowCounts(displayPairs: [(saved: DisplayLayout, live: LiveDisplayInfo)]) -> [String: Int] {
         var counts: [String: Int] = [:]
@@ -401,21 +448,19 @@ final class ProfileManager {
             if let mainWin = candidates.first(where: {
                 controller.isLikelyMainWindow($0, expectedFrame: expectedFrame, requireAXMetadata: true)
             }) {
-                // Brief settle for Chromium/Electron initial frame setup.
                 usleep(350_000)
                 let refreshed = inspector.listAllUserWindows().first(where: { $0.windowId == mainWin.windowId }) ?? mainWin
                 return (refreshed, sawSplash)
             }
 
-            // Bump wait when a splash/login popup appears (e.g., Prisma Access Browser auth screen).
             if !sawSplash && !candidates.isEmpty {
                 sawSplash = true
                 deadline = max(deadline, Date().addingTimeInterval(SpaceBootConfig.splashExtendedTimeoutSeconds))
                 SpaceBootLogger.log("Detected splash/loading window for \(appId); extending wait to \(Int(SpaceBootConfig.splashExtendedTimeoutSeconds))s")
             } else if !extendedForProcess && !NSRunningApplication.runningApplications(withBundleIdentifier: appId).isEmpty {
                 extendedForProcess = true
-                deadline = max(deadline, Date().addingTimeInterval(18.0))
-                SpaceBootLogger.log("App \(appId) process started; waiting up to 18s for main window")
+                deadline = max(deadline, Date().addingTimeInterval(SpaceBootConfig.processInitTimeoutSeconds))
+                SpaceBootLogger.log("App \(appId) process started; waiting up to \(Int(SpaceBootConfig.processInitTimeoutSeconds))s for main window")
             }
         }
         return nil
@@ -516,22 +561,6 @@ final class ProfileManager {
         return String(trimmed.prefix(40))
     }
 
-    private func defaultLaunchConfig(for win: LiveWindowInfo) -> LaunchConfig? {
-        if SpaceBootConfig.hostManagedBundleIds.contains(win.appId) {
-            return nil
-        }
-        if win.appId == "com.google.Chrome" {
-            return LaunchConfig(kind: "chrome_new_window", target: "")
-        }
-        if win.appId == "com.todesktop.230313mzl4w4u92" {
-            return LaunchConfig(kind: "cursor_new_window", target: "")
-        }
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: win.appId) {
-            return LaunchConfig(kind: "app", target: appURL.path)
-        }
-        return LaunchConfig(kind: "app", target: win.appName)
-    }
-
     private func matchWindowsOnSpace(saved: [WindowRecord], live: [LiveWindowInfo]) -> [Int: LiveWindowInfo] {
         var matched: [Int: LiveWindowInfo] = [:]
         var usedIds: Set<Int> = []
@@ -559,50 +588,5 @@ final class ProfileManager {
             }
         }
         return matched
-    }
-
-    private func triggerLaunch(_ spec: LaunchConfig) {
-        let process = Process()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
-        switch spec.kind {
-        case "chrome_new_window":
-            let chromeRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty
-            let targetUrl = spec.target.trimmingCharacters(in: .whitespacesAndNewlines)
-            if chromeRunning {
-                process.executableURL = URL(fileURLWithPath: SpaceBootConfig.chromeExecutablePath)
-                process.arguments = targetUrl.isEmpty ? ["--new-window"] : ["--new-window", targetUrl]
-            } else {
-                // Cold-starting Chrome must go through LaunchServices (`open -a`) so it does not inherit LSUIElement.
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                process.arguments = targetUrl.isEmpty
-                    ? ["-a", "/Applications/Google Chrome.app"]
-                    : ["-a", "/Applications/Google Chrome.app", "--args", "--new-window", targetUrl]
-            }
-
-        case "cursor_new_window":
-            if let cursorCli = SpaceBootConfig.resolveCursorCliPath() {
-                process.executableURL = URL(fileURLWithPath: cursorCli)
-                process.arguments = ["--new-window"]
-            } else {
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                process.arguments = ["-a", "Cursor"]
-            }
-
-        case "cursor_uri":
-            guard let cursorCli = SpaceBootConfig.resolveCursorCliPath() else { return }
-            process.executableURL = URL(fileURLWithPath: cursorCli)
-            process.arguments = ["--file-uri", spec.target]
-
-        case "app":
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-a", spec.target]
-
-        default:
-            return
-        }
-
-        try? process.run()
     }
 }

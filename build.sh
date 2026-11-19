@@ -10,6 +10,8 @@ cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 swiftc -O \
   "$SCRIPT_DIR/Sources/Logger.swift" \
   "$SCRIPT_DIR/Sources/Models.swift" \
+  "$SCRIPT_DIR/Sources/SymbolicHotKeys.swift" \
+  "$SCRIPT_DIR/Sources/AppLauncher.swift" \
   "$SCRIPT_DIR/Sources/SpaceInspector.swift" \
   "$SCRIPT_DIR/Sources/WindowController.swift" \
   "$SCRIPT_DIR/Sources/ProfileManager.swift" \

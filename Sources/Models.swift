@@ -6,7 +6,6 @@ enum SpaceBootConfig {
     static let appName = "SpaceBoot"
     static let bundleIdentifier = "com.spaceboot.SpaceBoot"
     static let profilesDirectory = "\(NSHomeDirectory())/.config/spaceboot/profiles"
-    static let chromeExecutablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
     static let minimumWindowWidth: Double = 150
     static let minimumWindowHeight: Double = 150
@@ -21,6 +20,7 @@ enum SpaceBootConfig {
     static let spaceSwitchPollMicros: useconds_t = 80_000
     static let spaceAnimationSettleMicros: useconds_t = 400_000
     static let launchWindowTimeoutSeconds: TimeInterval = 12.0
+    static let processInitTimeoutSeconds: TimeInterval = 18.0
     static let splashExtendedTimeoutSeconds: TimeInterval = 30.0
     static let launchPollMicros: useconds_t = 300_000
     static let frameVerifyTolerancePx = 24
@@ -30,7 +30,7 @@ enum SpaceBootConfig {
     static let raiseWindowDelayMicros: useconds_t = 70_000
     static let lateArrivalWatchSeconds: TimeInterval = 60.0
 
-    /// System/helper processes excluded from recorded layouts.
+    /// macOS system/daemon processes excluded from recorded workspace layouts.
     static let ignoredBundleIds: Set<String> = [
         "",
         "com.spaceboot.SpaceBoot",
@@ -45,22 +45,27 @@ enum SpaceBootConfig {
         "com.apple.UserNotificationCenter"
     ]
 
-    /// Sub-browsers or child apps launched by a parent host app rather than standalone.
-    static let hostManagedBundleIds: Set<String> = [
-        "com.adspower.SunBrowser",
-        "org.mozilla.FlowerBrowser"
-    ]
-
-    /// Resolves the Cursor CLI binary across common installation locations,
-    /// preferring the app bundle binary so GUI launches do not depend on shell $PATH shims.
-    static func resolveCursorCliPath() -> String? {
-        let candidates = [
-            "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
-            "/opt/homebrew/bin/cursor",
-            "/usr/local/bin/cursor",
-            "\(NSHomeDirectory())/.local/bin/cursor"
+    /// Returns true if `bundlePath` is a standard user-launchable macOS application bundle
+    /// (excluding embedded helper/sub-browser bundles inside Library/Application Support or another .app/Contents).
+    static func isStandaloneApplicationPath(_ bundlePath: String) -> Bool {
+        let standardized = (bundlePath as NSString).standardizingPath
+        if standardized.contains("/Library/Application Support/") {
+            return false
+        }
+        // Reject helper apps nested inside another .app bundle (e.g. Foo.app/Contents/Helpers/Bar.app).
+        if let firstAppRange = standardized.range(of: ".app/Contents/") {
+            let suffix = standardized[firstAppRange.upperBound...]
+            if suffix.contains(".app") {
+                return false
+            }
+        }
+        let standardRoots = [
+            "/Applications/",
+            "/System/Applications/",
+            "/System/Library/CoreServices/Finder.app",
+            "\(NSHomeDirectory())/Applications/"
         ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+        return standardRoots.contains { standardized.hasPrefix($0) }
     }
 }
 
@@ -81,10 +86,14 @@ struct WindowRect: Codable, Equatable {
 }
 
 struct LaunchConfig: Codable, Equatable {
-    /// Supported kinds: "app" | "chrome_new_window" | "cursor_new_window" | "cursor_uri"
+    /// Supported kinds:
+    /// - "app": Launch app via LaunchServices (cold) or AXMenuBar New Window (warm).
+    /// - "command": Execute custom shell command in the user's login shell ($SHELL -l -c).
     var kind: String
-    /// App path (for "app"), optional URL (for "chrome_new_window"), or workspace URI (for "cursor_uri").
+    /// Application bundle path (for "app") or shell command string (for "command").
     var target: String
+    /// Optional URL or file path to open with the app (for "app").
+    var url: String?
 }
 
 struct WindowRecord: Codable {

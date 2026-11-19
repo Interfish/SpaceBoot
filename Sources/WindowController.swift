@@ -6,13 +6,11 @@ import Foundation
 @_silgen_name("_AXUIElementGetWindow")
 func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
-/// Controls native Spaces navigation (with explicit target-display activation + verified Space arrival),
+/// Controls native Spaces navigation (dynamically reading the user's macOS Mission Control shortcuts),
 /// AX window metadata inspection, and verified cross-display window placement/z-order.
 final class WindowController {
-    private static let keyCodeLeftArrow: CGKeyCode = 123
-    private static let keyCodeRightArrow: CGKeyCode = 124
-
     private let inspector: SpaceInspector
+    private var loggedFilteredWindowIds: Set<Int> = []
 
     init(inspector: SpaceInspector) {
         self.inspector = inspector
@@ -51,16 +49,27 @@ final class WindowController {
         )
     }
 
-    private var loggedFilteredWindowIds: Set<Int> = []
+    /// Recording filter: accepts any normal standard window (including fixed-size utilities like Calculator),
+    /// rejecting only non-standard dialogs/tooltips/minimized windows.
+    func isRecordableWindow(_ win: LiveWindowInfo) -> Bool {
+        if let meta = inspectAXWindow(windowId: win.windowId, pid: win.pid) {
+            if !meta.isStandardMainWindow || !meta.isPositionSettable {
+                logFilterOnce(win.windowId, "Record skip non-standard wid=\(win.windowId) app=\(win.appName) role=\(meta.role) subrole=\(meta.subrole)")
+                return false
+            }
+        }
+        return true
+    }
 
-    /// Determines whether a window qualifies as a genuine main content window (filtering out splash/login popups).
-    /// When `requireAXMetadata` is true (used for newly spawned active-Space windows), transient/closing windows
-    /// whose AXUIElement is unavailable are rejected rather than accepted via size heuristics.
+    /// Boot filter: verifies a candidate window matches the expected target window and is not a splash/login popup.
     func isLikelyMainWindow(
         _ win: LiveWindowInfo,
-        expectedFrame: WindowRect? = nil,
+        expectedFrame: WindowRect,
         requireAXMetadata: Bool = false
     ) -> Bool {
+        let expectsLargeWindow = expectedFrame.width >= SpaceBootConfig.largeTargetMinWidth
+            && expectedFrame.height >= SpaceBootConfig.largeTargetMinHeight
+
         if let meta = inspectAXWindow(windowId: win.windowId, pid: win.pid) {
             if !meta.isStandardMainWindow {
                 logFilterOnce(win.windowId, "Filter non-standard window wid=\(win.windowId) app=\(win.appName) role=\(meta.role) subrole=\(meta.subrole) min=\(meta.isMinimized)")
@@ -70,22 +79,16 @@ final class WindowController {
                 logFilterOnce(win.windowId, "Filter immovable window wid=\(win.windowId) app=\(win.appName)")
                 return false
             }
-            // Splash/login windows are typically non-resizable and small compared to the saved browser window.
-            if let expected = expectedFrame,
-               expected.width >= SpaceBootConfig.largeTargetMinWidth,
-               expected.height >= SpaceBootConfig.largeTargetMinHeight {
+            if expectsLargeWindow {
                 if !meta.isSizeSettable {
                     logFilterOnce(win.windowId, "Filter non-resizable splash wid=\(win.windowId) app=\(win.appName) size=\(win.frame.width)x\(win.frame.height)")
                     return false
                 }
                 if win.frame.width < SpaceBootConfig.splashFilterMinWidth ||
                    win.frame.height < SpaceBootConfig.splashFilterMinHeight {
-                    logFilterOnce(win.windowId, "Filter small splash wid=\(win.windowId) app=\(win.appName) size=\(win.frame.width)x\(win.frame.height) expected=\(expected.width)x\(expected.height)")
+                    logFilterOnce(win.windowId, "Filter small splash wid=\(win.windowId) app=\(win.appName) size=\(win.frame.width)x\(win.frame.height) expected=\(expectedFrame.width)x\(expectedFrame.height)")
                     return false
                 }
-            } else if !meta.isSizeSettable && (win.frame.width < 450 || win.frame.height < 450) {
-                logFilterOnce(win.windowId, "Filter small fixed helper wid=\(win.windowId) app=\(win.appName) size=\(win.frame.width)x\(win.frame.height)")
-                return false
             }
             return true
         }
@@ -94,29 +97,21 @@ final class WindowController {
             return false
         }
 
-        // If AX metadata wasn't readable (e.g., off-Space window during Record), apply conservative size heuristic.
-        if let expected = expectedFrame,
-           expected.width >= SpaceBootConfig.largeTargetMinWidth,
-           expected.height >= SpaceBootConfig.largeTargetMinHeight {
+        if expectsLargeWindow {
             return win.frame.width >= SpaceBootConfig.splashFilterMinWidth &&
                    win.frame.height >= SpaceBootConfig.splashFilterMinHeight
         }
         return true
     }
 
-    private func logFilterOnce(_ windowId: Int, _ message: String) {
-        if loggedFilteredWindowIds.insert(windowId).inserted {
-            SpaceBootLogger.log(message)
-        }
-    }
+    // MARK: - Space Switching (Adaptive to User's macOS Shortcuts)
 
-    // MARK: - Space Switching
-
-    /// Activates the target display and navigates it to `targetIndex` (0-based desktop Space),
-    /// verifying arrival via SkyLight after each step.
+    /// Navigates the specified display to `targetIndex` (0-based desktop Space),
+    /// using direct "Switch to Desktop N" shortcut if enabled, otherwise stepping with the user's Move Left/Right shortcut.
     @discardableResult
     func switchDisplay(_ displayUUID: String, toSpaceIndex targetIndex: Int) -> Bool {
-        guard let initialDisplay = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+        let allDisplays = inspector.listDisplays()
+        guard let initialDisplay = allDisplays.first(where: { $0.uuid == displayUUID }),
               targetIndex >= 0, targetIndex < initialDisplay.desktopSpaceIds.count else {
             SpaceBootLogger.log("switchDisplay invalid display=\(displayUUID) targetIndex=\(targetIndex)")
             return false
@@ -128,6 +123,28 @@ final class WindowController {
         if initialDisplay.currentSpaceId == targetSpaceId {
             SpaceBootLogger.log("switchDisplay \(initialDisplay.name) already on space[\(targetIndex)] (id=\(targetSpaceId))")
             return true
+        }
+
+        let hotKeys = SymbolicHotKeys()
+
+        // Fast path: if the user enabled "Switch to Desktop N" in System Settings, jump directly in 1 hop.
+        if let globalIdx = globalDesktopIndex(displayUUID: displayUUID, localIndex: targetIndex, in: allDisplays),
+           let directShortcut = hotKeys.directDesktopShortcut(globalIndex: globalIdx) {
+            SpaceBootLogger.log("switchDisplay \(initialDisplay.name) direct jump -> global Desktop \(globalIdx + 1) (id=\(targetSpaceId))")
+            let prevId = initialDisplay.currentSpaceId
+            postShortcut(directShortcut)
+            if waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId),
+               inspector.listDisplays().first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId {
+                SpaceBootLogger.log("switchDisplay direct jump arrived at \(initialDisplay.name) space[\(targetIndex)]")
+                return true
+            }
+            SpaceBootLogger.log("switchDisplay direct jump did not land on id=\(targetSpaceId); falling back to step navigation")
+        }
+
+        guard let leftShortcut = hotKeys.moveLeftShortcut(),
+              let rightShortcut = hotKeys.moveRightShortcut() else {
+            SpaceBootLogger.log("switchDisplay FAILED: Move Left/Right Space shortcuts are disabled in macOS System Settings")
+            return false
         }
 
         SpaceBootLogger.log("switchDisplay \(initialDisplay.name) from space[\(initialDisplay.currentSpaceIndex ?? -1)] (id=\(initialDisplay.currentSpaceId)) -> space[\(targetIndex)] (id=\(targetSpaceId))")
@@ -145,21 +162,20 @@ final class WindowController {
 
             focusDisplay(live)
             guard let currentIdx = live.currentSpaceIndex else {
-                postControlArrow(keyCode: Self.keyCodeLeftArrow)
+                postShortcut(leftShortcut)
                 _ = waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: live.currentSpaceId)
                 continue
             }
 
-            let keyCode = targetIndex > currentIdx ? Self.keyCodeRightArrow : Self.keyCodeLeftArrow
+            let shortcut = targetIndex > currentIdx ? rightShortcut : leftShortcut
             let prevId = live.currentSpaceId
-            postControlArrow(keyCode: keyCode)
+            postShortcut(shortcut)
 
             if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId) {
-                // Retry once by explicitly clicking an empty desktop area on this display to force active-display focus.
                 SpaceBootLogger.log("switchDisplay step \(step) did not move \(live.name); retrying with desktop focus click")
                 clickSafePointOnDisplay(live)
                 usleep(120_000)
-                postControlArrow(keyCode: keyCode)
+                postShortcut(shortcut)
                 if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId) {
                     SpaceBootLogger.log("switchDisplay FAILED on \(live.name) (still id=\(prevId))")
                     return false
@@ -171,11 +187,10 @@ final class WindowController {
             .first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId
     }
 
-    /// Moves pointer and transfers active-display focus to `display` so Ctrl+Arrow and new windows target it.
+    /// Moves pointer and transfers active-display focus to `display` so Space navigation and new windows target it.
     func focusDisplay(_ display: LiveDisplayInfo) {
         moveMouse(to: display.cgCenter)
 
-        // Prefer focusing an existing visible window already on this display's current Space (no click side effects).
         let windowsOnCurrentSpace = inspector.listAllUserWindows().filter {
             $0.spaceIds.contains(display.currentSpaceId)
         }
@@ -185,7 +200,6 @@ final class WindowController {
             return
         }
 
-        // Empty Space: click the empty desktop so macOS switches keyboard/Space focus to this display.
         clickSafePointOnDisplay(display)
         usleep(80_000)
     }
@@ -193,7 +207,7 @@ final class WindowController {
     // MARK: - Verified Cross-Display Window Frame & Z-Order
 
     /// Sets window frame using position -> size -> position -> size and verifies arrival
-    /// (retrying if Chrome/Electron snaps back asynchronously during startup).
+    /// (retrying if Chromium/Electron snaps back asynchronously during startup).
     @discardableResult
     func setWindowFrameVerified(windowId: Int, pid: pid_t, frame: WindowRect, targetSpaceId: Int? = nil) -> Bool {
         guard AXIsProcessTrusted() else { return false }
@@ -231,6 +245,17 @@ final class WindowController {
     }
 
     // MARK: - Private Helpers
+
+    private func globalDesktopIndex(displayUUID: String, localIndex: Int, in displays: [LiveDisplayInfo]) -> Int? {
+        var offset = 0
+        for d in displays {
+            if d.uuid == displayUUID {
+                return offset + localIndex
+            }
+            offset += d.desktopSpaceIds.count
+        }
+        return nil
+    }
 
     private func applyAXFrameOnce(windowId: Int, pid: pid_t, frame: WindowRect) -> Bool {
         guard let axWindow = findAXWindow(windowId: windowId, pid: pid) else { return false }
@@ -278,6 +303,12 @@ final class WindowController {
         return ref as? String
     }
 
+    private func logFilterOnce(_ windowId: Int, _ message: String) {
+        if loggedFilteredWindowIds.insert(windowId).inserted {
+            SpaceBootLogger.log(message)
+        }
+    }
+
     private func moveMouse(to point: CGPoint) {
         CGWarpMouseCursorPosition(point)
         if let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left) {
@@ -285,7 +316,6 @@ final class WindowController {
         }
     }
 
-    /// Clicks an uncovered point on `display` (or neutral menu bar midpoint if fully covered) to focus that display.
     private func clickSafePointOnDisplay(_ display: LiveDisplayInfo) {
         let windowsOnSpace = inspector.listAllUserWindows().filter {
             $0.spaceIds.contains(display.currentSpaceId)
@@ -298,7 +328,7 @@ final class WindowController {
             display.cgCenter,
             CGPoint(x: display.cgFrame.minX + 40, y: display.cgFrame.maxY - 60),
             CGPoint(x: display.cgFrame.maxX - 40, y: display.cgFrame.maxY - 60),
-            CGPoint(x: display.cgFrame.midX, y: display.cgFrame.minY + 12) // Empty middle of display menu bar
+            CGPoint(x: display.cgFrame.midX, y: display.cgFrame.minY + 12)
         ]
 
         let targetPoint = candidates.first { pt in
@@ -317,16 +347,14 @@ final class WindowController {
         }
     }
 
-    private func postControlArrow(keyCode: CGKeyCode) {
+    private func postShortcut(_ shortcut: KeyShortcut) {
         let source = CGEventSource(stateID: .hidSystemState)
-        let flags: CGEventFlags = [.maskControl, .maskNumericPad, .maskSecondaryFn]
-
-        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+        guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: shortcut.keyCode, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: shortcut.keyCode, keyDown: false) else {
             return
         }
-        keyDown.flags = flags
-        keyUp.flags = flags
+        keyDown.flags = shortcut.flags
+        keyUp.flags = shortcut.flags
 
         keyDown.post(tap: .cghidEventTap)
         usleep(50_000)
