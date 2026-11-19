@@ -8,6 +8,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let inspector = SpaceInspector()
     private lazy var controller = WindowController(inspector: inspector)
     private lazy var profileManager = ProfileManager(inspector: inspector, controller: controller)
+    private let orderStore = HotkeyOrderStore()
+    private lazy var orderWindowController = HotkeyOrderWindowController(inspector: inspector, orderStore: orderStore)
     private let hotKeyManager = HotKeyManager()
     private let interactiveSwitchQueue = DispatchQueue(label: "com.spaceboot.interactive-switch", qos: .userInteractive)
 
@@ -60,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !isBusy else { return }
 
         switch action {
-        case .switchDesktop(let globalIndex):
+        case .switchDesktop(let slotIndex):
             guard !isSwitchingSpace else { return }
             isSwitchingSpace = true
             interactiveSwitchQueue.async { [weak self] in
@@ -69,10 +71,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 guard let self = self else { return }
                 if !AXIsProcessTrusted() {
-                    SpaceBootLogger.log("Hotkey ⌥\(globalIndex + 1) ignored: AXIsProcessTrusted is false")
+                    SpaceBootLogger.log("Hotkey ⌥\(slotIndex + 1) ignored: AXIsProcessTrusted is false")
                     return
                 }
-                _ = self.controller.switchToGlobalDesktop(index: globalIndex)
+                let ordered = self.orderStore.orderedSlots(from: self.inspector.listDisplays())
+                guard slotIndex >= 0, slotIndex < ordered.count else { return }
+                let target = ordered[slotIndex]
+                _ = self.controller.switchToSlot(target.key)
             }
 
         case .bootMatchingProfile:
@@ -146,35 +151,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             empty.isEnabled = false
             menu.addItem(empty)
         } else {
-            let header = NSMenuItem(title: "Active Displays & Spaces", action: nil, keyEquivalent: "")
+            let header = NSMenuItem(title: "Spaces (Hotkey Order)", action: nil, keyEquivalent: "")
             header.isEnabled = false
             menu.addItem(header)
 
-            var globalDesktopNumber = 1
-            for d in liveDisplays {
-                let displayHeader = NSMenuItem(title: "  \(d.name)", action: nil, keyEquivalent: "")
-                displayHeader.isEnabled = false
-                menu.addItem(displayHeader)
-
-                for (localIdx, spaceId) in d.desktopSpaceIds.enumerated() {
-                    let isCurrent = (spaceId == d.currentSpaceId)
-                    let marker = isCurrent ? "●" : "○"
-                    let keyHint = (hotKeysEnabled && globalDesktopNumber <= 9) ? "\(globalDesktopNumber)" : ""
-                    let item = NSMenuItem(
-                        title: "    \(marker) Desktop \(globalDesktopNumber) (Space \(localIdx + 1))",
-                        action: #selector(handleSwitchDesktopMenu(_:)),
-                        keyEquivalent: keyHint
-                    )
-                    if !keyHint.isEmpty {
-                        item.keyEquivalentModifierMask = .option
-                    }
-                    item.representedObject = (d.uuid, localIdx)
-                    item.target = self
-                    item.isEnabled = !isBusy
-                    menu.addItem(item)
-                    globalDesktopNumber += 1
+            let ordered = orderStore.orderedSlots(from: liveDisplays)
+            for (idx, slot) in ordered.enumerated() {
+                let marker = slot.isCurrent ? "●" : "○"
+                let keyHint = (hotKeysEnabled && idx < 9) ? "\(idx + 1)" : ""
+                let item = NSMenuItem(
+                    title: "  \(marker) \(slot.displayName) · Space \(slot.key.spaceIndex + 1)",
+                    action: #selector(handleSwitchDesktopMenu(_:)),
+                    keyEquivalent: keyHint
+                )
+                if !keyHint.isEmpty {
+                    item.keyEquivalentModifierMask = .option
                 }
+                item.representedObject = slot.key
+                item.target = self
+                item.isEnabled = !isBusy
+                menu.addItem(item)
             }
+
+            let customizeOrderItem = NSMenuItem(
+                title: "  Customize Hotkey Order…",
+                action: #selector(handleCustomizeHotkeyOrder),
+                keyEquivalent: ""
+            )
+            customizeOrderItem.target = self
+            menu.addItem(customizeOrderItem)
         }
 
         menu.addItem(.separator())
@@ -283,12 +288,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func handleSwitchDesktopMenu(_ sender: NSMenuItem) {
         guard !isBusy, !isSwitchingSpace,
-              let target = sender.representedObject as? (String, Int) else { return }
+              let key = sender.representedObject as? SpaceSlotKey else { return }
         isSwitchingSpace = true
         interactiveSwitchQueue.async { [weak self] in
             defer { DispatchQueue.main.async { self?.isSwitchingSpace = false } }
-            _ = self?.controller.switchDisplay(target.0, toSpaceIndex: target.1, settleForLaunch: false)
+            _ = self?.controller.switchToSlot(key)
         }
+    }
+
+    @objc private func handleCustomizeHotkeyOrder() {
+        orderWindowController.showAndRefresh()
     }
 
     @objc private func handleToggleHotKeys() {

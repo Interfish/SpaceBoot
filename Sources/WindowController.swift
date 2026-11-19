@@ -162,18 +162,18 @@ final class WindowController {
         let hotKeys = SymbolicHotKeys()
         let stepSettleMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceAnimationSettleMicros : 160_000
 
-        // Fast path: if the user enabled "Switch to Desktop N" in System Settings, jump directly in 1 hop.
+        // Fast path: if the user enabled "Switch to Desktop N" in System Settings, jump directly in 1 hop
+        // (no stepping through intermediate spaces, no focus dependency).
         if let globalIdx = globalDesktopIndex(displayUUID: displayUUID, localIndex: targetIndex, in: allDisplays),
            let directShortcut = hotKeys.directDesktopShortcut(globalIndex: globalIdx) {
             SpaceBootLogger.log("switchDisplay \(initialDisplay.name) direct jump -> global Desktop \(globalIdx + 1) (id=\(targetSpaceId))")
             let prevId = initialDisplay.currentSpaceId
             postShortcut(directShortcut)
-            if waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros),
-               inspector.listDisplays().first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId {
+            if waitForSpaceArrival(displayUUID: displayUUID, targetSpaceId: targetSpaceId, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
                 SpaceBootLogger.log("switchDisplay direct jump arrived at \(initialDisplay.name) space[\(targetIndex)]")
                 return true
             }
-            SpaceBootLogger.log("switchDisplay direct jump did not land on id=\(targetSpaceId); falling back to step navigation")
+            SpaceBootLogger.log("switchDisplay direct jump did not land on id=\(targetSpaceId); falling back to burst navigation")
         }
 
         guard let leftShortcut = hotKeys.moveLeftShortcut(),
@@ -183,6 +183,25 @@ final class WindowController {
         }
 
         SpaceBootLogger.log("switchDisplay \(initialDisplay.name) from space[\(initialDisplay.currentSpaceIndex ?? -1)] (id=\(initialDisplay.currentSpaceId)) -> space[\(targetIndex)] (id=\(targetSpaceId))")
+
+        // Burst path: when stepping multiple Spaces (e.g. Space 1 -> Space 3), fire the directional shortcuts
+        // rapidly (75ms apart) so WindowServer coalesces them into one continuous smooth slide.
+        if let startIdx = initialDisplay.currentSpaceIndex {
+            let delta = targetIndex - startIdx
+            let steps = abs(delta)
+            if steps > 1 {
+                let burstShortcut = delta > 0 ? rightShortcut : leftShortcut
+                let prevId = initialDisplay.currentSpaceId
+                for i in 0..<steps {
+                    if i > 0 { usleep(75_000) }
+                    postShortcut(burstShortcut)
+                }
+                if waitForSpaceArrival(displayUUID: displayUUID, targetSpaceId: targetSpaceId, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
+                    SpaceBootLogger.log("switchDisplay burst arrived at \(initialDisplay.name) space[\(targetIndex)] in \(steps) coalesced step(s)")
+                    return true
+                }
+            }
+        }
 
         let maxSteps = initialDisplay.desktopSpaceIds.count + 2
         for step in 0..<maxSteps {
@@ -224,20 +243,10 @@ final class WindowController {
             .first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId
     }
 
-    /// Switches directly to a 0-based global desktop index sequentially across connected displays.
+    /// Switches directly to a specific Space slot key (used by customizable ⌥1–⌥9 hotkeys).
     @discardableResult
-    func switchToGlobalDesktop(index globalIndex: Int) -> Bool {
-        let displays = inspector.listDisplays()
-        var offset = 0
-        for display in displays {
-            let count = display.desktopSpaceIds.count
-            if globalIndex >= offset && globalIndex < offset + count {
-                let localIdx = globalIndex - offset
-                return switchDisplay(display.uuid, toSpaceIndex: localIdx, settleForLaunch: false)
-            }
-            offset += count
-        }
-        return false
+    func switchToSlot(_ key: SpaceSlotKey) -> Bool {
+        switchDisplay(key.displayUUID, toSpaceIndex: key.spaceIndex, settleForLaunch: false)
     }
 
     /// Transfers active-display focus to `display` so Space navigation and new windows target it.
@@ -442,6 +451,24 @@ final class WindowController {
             }
             usleep(15_000)
         }
+    }
+
+    private func waitForSpaceArrival(
+        displayUUID: String,
+        targetSpaceId: Int,
+        previousSpaceId: Int,
+        settleMicros: useconds_t
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(SpaceBootConfig.spaceSwitchTimeoutSeconds)
+        while Date() < deadline {
+            usleep(SpaceBootConfig.spaceSwitchPollMicros)
+            if let live = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+               live.currentSpaceId == targetSpaceId {
+                usleep(settleMicros)
+                return true
+            }
+        }
+        return false
     }
 
     private func waitForSpaceChange(displayUUID: String, previousSpaceId: Int, settleMicros: useconds_t) -> Bool {
