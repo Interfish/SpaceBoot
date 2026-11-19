@@ -334,6 +334,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         body: "\"\(profile.name)\" restored \(result.matched)/\(result.total) windows."
                     )
                 }
+            } catch let actionError as ProfileActionError {
+                SpaceBootLogger.log("Apply error: \(actionError.localizedDescription)")
+                DispatchQueue.main.async {
+                    self.setBusy(false)
+                    if !silentErrors {
+                        if case .insufficientSpaces = actionError {
+                            self.showInsufficientSpacesAlert(message: actionError.localizedDescription)
+                        } else {
+                            self.showErrorAlert(title: "Unable to Boot \"\(profile.name)\"", message: actionError.localizedDescription)
+                        }
+                    }
+                }
             } catch {
                 SpaceBootLogger.log("Apply error: \(error.localizedDescription)")
                 DispatchQueue.main.async {
@@ -374,6 +386,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if alert.runModal() == .alertFirstButtonReturn,
            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func showInsufficientSpacesAlert(message: String) {
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Not Enough Desktop Spaces"
+        alert.informativeText = message
+        alert.addButton(withTitle: "Open Mission Control")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            runShell("/usr/bin/open", ["-a", "Mission Control"])
         }
     }
 

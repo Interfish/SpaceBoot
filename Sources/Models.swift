@@ -28,6 +28,9 @@ enum SpaceBootConfig {
     static let frameVerifyDelayMicros: useconds_t = 220_000
     static let replacementWatchDelayMicros: useconds_t = 900_000
     static let raiseWindowDelayMicros: useconds_t = 70_000
+    static let parallelLaunchStaggerMicros: useconds_t = 400_000
+    static let postBootSettleGuardSeconds: TimeInterval = 15.0
+    static let postBootSettlePollMicros: useconds_t = 800_000
     static let lateArrivalWatchSeconds: TimeInterval = 60.0
 
     /// macOS system/daemon processes excluded from recorded workspace layouts.

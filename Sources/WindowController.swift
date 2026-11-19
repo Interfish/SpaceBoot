@@ -207,10 +207,13 @@ final class WindowController {
     // MARK: - Verified Cross-Display Window Frame & Z-Order
 
     /// Sets window frame using position -> size -> position -> size and verifies arrival
-    /// (retrying if Chromium/Electron snaps back asynchronously during startup).
+    /// (retrying if Chromium/Electron snaps back asynchronously during startup, and stopping early
+    /// if macOS clamps the window to the exact same bounds on the target Space).
     @discardableResult
     func setWindowFrameVerified(windowId: Int, pid: pid_t, frame: WindowRect, targetSpaceId: Int? = nil) -> Bool {
         guard AXIsProcessTrusted() else { return false }
+
+        var previousRect: WindowRect?
 
         for attempt in 1...SpaceBootConfig.frameApplyMaxAttempts {
             let applied = applyAXFrameOnce(windowId: windowId, pid: pid, frame: frame)
@@ -225,6 +228,17 @@ final class WindowController {
                     }
                     return true
                 }
+                // If the window is already on the target Space at the right origin and clamped identically across 2 tries
+                // (e.g., macOS Dock or app min/max size constraint), accept without burning remaining retries.
+                if spaceOk,
+                   let prev = previousRect,
+                   prev == live.frame,
+                   abs(live.frame.x - frame.x) <= SpaceBootConfig.frameVerifyTolerancePx,
+                   abs(live.frame.y - frame.y) <= SpaceBootConfig.frameVerifyTolerancePx {
+                    SpaceBootLogger.log("Frame clamped by OS/app on target Space for wid=\(windowId) (\(live.appName)): \(live.frame) (requested \(frame))")
+                    return true
+                }
+                previousRect = live.frame
                 SpaceBootLogger.log("Frame attempt \(attempt) for wid=\(windowId) (\(live.appName)): got \(live.frame) sp=\(live.spaceIds), want \(frame) sp=\(targetSpaceId ?? -1) (applied=\(applied))")
             } else {
                 SpaceBootLogger.log("Frame attempt \(attempt): wid=\(windowId) no longer in window list")

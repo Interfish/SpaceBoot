@@ -33,7 +33,51 @@ private struct PendingLateWindow {
     let existingIdsAtLaunch: Set<Int>
 }
 
-/// Handles profile persistence, instant multi-Space recording, and universal Space boot/restoration.
+private final class SettleGuardEntry {
+    var windowId: Int
+    var pid: pid_t
+    let appId: String
+    let appName: String
+    var expectedFrame: WindowRect
+    let targetDisplayUUID: String
+    let targetSpaceId: Int
+
+    init(
+        windowId: Int,
+        pid: pid_t,
+        appId: String,
+        appName: String,
+        expectedFrame: WindowRect,
+        targetDisplayUUID: String,
+        targetSpaceId: Int
+    ) {
+        self.windowId = windowId
+        self.pid = pid
+        self.appId = appId
+        self.appName = appName
+        self.expectedFrame = expectedFrame
+        self.targetDisplayUUID = targetDisplayUUID
+        self.targetSpaceId = targetSpaceId
+    }
+}
+
+private final class ParallelLaunchSlot {
+    let savedIndex: Int
+    let savedWindow: WindowRecord
+    var deadline: Date
+    var extendedForProcess = false
+    var sawSplash = false
+    var resolvedWindow: LiveWindowInfo?
+
+    init(savedIndex: Int, savedWindow: WindowRecord, initialDeadline: Date) {
+        self.savedIndex = savedIndex
+        self.savedWindow = savedWindow
+        self.deadline = initialDeadline
+    }
+}
+
+/// Handles profile persistence, instant multi-Space recording, pipelined parallel launching,
+/// and post-boot settle guards for apps that reposition themselves asynchronously after startup.
 final class ProfileManager {
     private let inspector: SpaceInspector
     private let controller: WindowController
@@ -181,7 +225,7 @@ final class ProfileManager {
         }
     }
 
-    // MARK: - Boot & Restore
+    // MARK: - Boot & Restore (Pipelined Parallel Launch + Post-Boot Settle Guard)
 
     func applyProfile(_ profile: SpaceBootProfile, launchMissing: Bool) throws -> (matched: Int, total: Int) {
         guard inspector.isAvailable else { throw ProfileActionError.skyLightUnavailable }
@@ -211,7 +255,6 @@ final class ProfileManager {
             throw ProfileActionError.insufficientSpaces(insufficient)
         }
 
-        // Verify at least one Space-switching method is available if multi-Space navigation is needed.
         let needsSpaceSwitch = displayPairs.contains { pair in
             pair.saved.spaces.filter { !$0.windows.isEmpty }.count > 1 ||
             pair.saved.spaces.contains { !$0.windows.isEmpty && $0.spaceIndex != (pair.live.currentSpaceIndex ?? -1) }
@@ -230,11 +273,12 @@ final class ProfileManager {
         var matchedCount = 0
         let totalCount = profile.totalWindowCount
         var pendingLateWindows: [PendingLateWindow] = []
+        var settleGuardEntries: [SettleGuardEntry] = []
 
         for pair in displayPairs {
             let liveUUID = pair.live.uuid
 
-            // Process activeSpaceIndex LAST so the display naturally finishes on the user's primary working Space.
+            // Process activeSpaceIndex LAST so the display naturally finishes on the user's active Space.
             let nonEmptySpaces = pair.saved.spaces.filter { !$0.windows.isEmpty }
             let orderedSpaces = nonEmptySpaces.sorted { lhs, rhs in
                 if lhs.spaceIndex == pair.saved.activeSpaceIndex { return false }
@@ -280,66 +324,33 @@ final class ProfileManager {
                     }
                 }
 
-                // Launch missing windows sequentially while this display & Space are active.
+                // Launch all missing windows in this Space using staggered parallel waves (place each as soon as ready).
                 if launchMissing {
-                    for (idx, savedWin) in savedSpace.windows.enumerated() where assignments[idx] == nil {
-                        guard let launch = savedWin.launch else { continue }
-                        let currentAll = inspector.listAllUserWindows()
-                        let existingIds = Set(currentAll.map { $0.windowId })
-                        let appAlreadyHasWindow = currentAll.contains { $0.appId == savedWin.appId }
-
-                        SpaceBootLogger.log("Launching \(savedWin.appName) (kind=\(launch.kind), hasWindow=\(appAlreadyHasWindow)) for \(pair.saved.displayName) space[\(savedSpace.spaceIndex)]")
-                        let outcome = launcher.launchWindow(
-                            appId: savedWin.appId,
-                            spec: launch,
-                            appAlreadyHasWindow: appAlreadyHasWindow
-                        )
-
-                        switch outcome {
-                        case .singleWindowAlreadyOpen:
-                            continue
-                        case .failed(let reason):
-                            SpaceBootLogger.log("Launch failed for \(savedWin.appName): \(reason)")
-                            continue
-                        case .triggered:
-                            break
-                        }
-
-                        if let result = waitForMainWindow(
-                            appId: savedWin.appId,
-                            expectedFrame: savedWin.frame,
-                            excluding: existingIds
-                        ) {
-                            let newWin = result.window
-                            assignments[idx] = newWin
-                            claimedWindowIds.insert(newWin.windowId)
-                            _ = controller.setWindowFrameVerified(
-                                windowId: newWin.windowId,
-                                pid: newWin.pid,
-                                frame: savedWin.frame,
-                                targetSpaceId: targetSpaceId
-                            )
-                            if result.sawSplash,
-                               let replaced = watchForWindowReplacement(
-                                   original: newWin,
-                                   expectedFrame: savedWin.frame,
-                                   excluding: existingIds
-                               ) {
-                                SpaceBootLogger.log("Detected replacement window wid=\(replaced.windowId) for \(savedWin.appName)")
-                                assignments[idx] = replaced
-                                claimedWindowIds.insert(replaced.windowId)
-                            }
-                        } else {
-                            SpaceBootLogger.log("Timed out waiting for main window of \(savedWin.appName); queuing late-arrival watcher")
-                            pendingLateWindows.append(PendingLateWindow(
-                                appId: savedWin.appId,
-                                appName: savedWin.appName,
-                                savedWindow: savedWin,
-                                targetSpaceId: targetSpaceId,
-                                existingIdsAtLaunch: existingIds
-                            ))
-                        }
+                    let missingIndices = savedSpace.windows.indices.filter {
+                        assignments[$0] == nil && savedSpace.windows[$0].launch != nil
                     }
+                    let launchedResult = launchMissingInParallelWaves(
+                        missingIndices: missingIndices,
+                        savedWindows: savedSpace.windows,
+                        displayName: pair.saved.displayName,
+                        displayUUID: liveUUID,
+                        spaceIndex: savedSpace.spaceIndex,
+                        targetSpaceId: targetSpaceId,
+                        claimedWindowIds: &claimedWindowIds
+                    )
+                    for (idx, win) in launchedResult.resolved {
+                        assignments[idx] = win
+                        settleGuardEntries.append(SettleGuardEntry(
+                            windowId: win.windowId,
+                            pid: win.pid,
+                            appId: savedSpace.windows[idx].appId,
+                            appName: savedSpace.windows[idx].appName,
+                            expectedFrame: savedSpace.windows[idx].frame,
+                            targetDisplayUUID: liveUUID,
+                            targetSpaceId: targetSpaceId
+                        ))
+                    }
+                    pendingLateWindows.append(contentsOf: launchedResult.timedOut)
                 }
 
                 // Final verified frame placement for every matched window on this Space.
@@ -367,12 +378,240 @@ final class ProfileManager {
             _ = controller.switchDisplay(liveUUID, toSpaceIndex: finalIndex)
         }
 
+        // Background watchers: catch late-auth apps AND re-snap apps (e.g., Electron) that call window.center() after boot.
         if !pendingLateWindows.isEmpty {
             watchPendingLateWindows(pendingLateWindows)
         }
+        if !settleGuardEntries.isEmpty {
+            startPostBootSettleGuard(entries: settleGuardEntries, knownWindowIds: claimedWindowIds)
+        }
 
-        SpaceBootLogger.log("=== APPLY DONE profile=\(profile.name) matched=\(matchedCount)/\(totalCount) pendingLate=\(pendingLateWindows.count) ===")
+        SpaceBootLogger.log("=== APPLY DONE profile=\(profile.name) matched=\(matchedCount)/\(totalCount) pendingLate=\(pendingLateWindows.count) settleGuarded=\(settleGuardEntries.count) ===")
         return (matchedCount, totalCount)
+    }
+
+    // MARK: - Parallel Pipelined Launching (Per Space)
+
+    /// Splits missing windows on a Space into parallel waves (at most 1 launch per distinct appId per wave),
+    /// fires launches staggered by ~0.4s, and snaps each window into place the moment it becomes ready.
+    private func launchMissingInParallelWaves(
+        missingIndices: [Int],
+        savedWindows: [WindowRecord],
+        displayName: String,
+        displayUUID: String,
+        spaceIndex: Int,
+        targetSpaceId: Int,
+        claimedWindowIds: inout Set<Int>
+    ) -> (resolved: [Int: LiveWindowInfo], timedOut: [PendingLateWindow]) {
+        var remainingIndices = missingIndices
+        var resolvedAll: [Int: LiveWindowInfo] = [:]
+        var timedOutAll: [PendingLateWindow] = []
+
+        while !remainingIndices.isEmpty {
+            // Pick at most one pending entry per distinct appId for this parallel wave so new windows map unambiguously.
+            var waveIndices: [Int] = []
+            var seenAppIds: Set<String> = []
+            var nextWaveIndices: [Int] = []
+
+            for idx in remainingIndices {
+                let appId = savedWindows[idx].appId
+                if seenAppIds.insert(appId).inserted {
+                    waveIndices.append(idx)
+                } else {
+                    nextWaveIndices.append(idx)
+                }
+            }
+            remainingIndices = nextWaveIndices
+
+            let baselineSnapshot = inspector.listAllUserWindows()
+            let baselineIds = Set(baselineSnapshot.map { $0.windowId })
+            var activeSlots: [ParallelLaunchSlot] = []
+
+            // Stagger-fire all launches in this parallel wave (~0.4s apart).
+            for (wavePos, idx) in waveIndices.enumerated() {
+                let savedWin = savedWindows[idx]
+                guard let launch = savedWin.launch else { continue }
+                let appHasWindow = baselineSnapshot.contains { $0.appId == savedWin.appId }
+
+                if wavePos > 0 {
+                    usleep(SpaceBootConfig.parallelLaunchStaggerMicros)
+                }
+
+                SpaceBootLogger.log("Parallel launch [\(wavePos + 1)/\(waveIndices.count)] \(savedWin.appName) (kind=\(launch.kind), hasWindow=\(appHasWindow)) for \(displayName) space[\(spaceIndex)]")
+                let outcome = launcher.launchWindow(
+                    appId: savedWin.appId,
+                    spec: launch,
+                    appAlreadyHasWindow: appHasWindow
+                )
+
+                switch outcome {
+                case .triggered:
+                    let slot = ParallelLaunchSlot(
+                        savedIndex: idx,
+                        savedWindow: savedWin,
+                        initialDeadline: Date().addingTimeInterval(SpaceBootConfig.launchWindowTimeoutSeconds)
+                    )
+                    activeSlots.append(slot)
+                case .singleWindowAlreadyOpen:
+                    break
+                case .failed(let reason):
+                    SpaceBootLogger.log("Launch failed for \(savedWin.appName): \(reason)")
+                }
+            }
+
+            // Unified ready-poll loop: position each window immediately as soon as its main AXStandardWindow appears.
+            var waveClaimedIds = baselineIds.union(claimedWindowIds)
+            while activeSlots.contains(where: { $0.resolvedWindow == nil && Date() < $0.deadline }) {
+                usleep(SpaceBootConfig.launchPollMicros)
+                let liveNow = inspector.listAllUserWindows()
+
+                for slot in activeSlots where slot.resolvedWindow == nil && Date() < slot.deadline {
+                    let appId = slot.savedWindow.appId
+                    let candidates = liveNow.filter {
+                        $0.appId == appId && !waveClaimedIds.contains($0.windowId)
+                    }
+
+                    if let mainWin = candidates.first(where: {
+                        controller.isLikelyMainWindow($0, expectedFrame: slot.savedWindow.frame, requireAXMetadata: true)
+                    }) {
+                        usleep(300_000)
+                        let refreshed = inspector.listAllUserWindows().first(where: { $0.windowId == mainWin.windowId }) ?? mainWin
+                        slot.resolvedWindow = refreshed
+                        waveClaimedIds.insert(refreshed.windowId)
+                        claimedWindowIds.insert(refreshed.windowId)
+
+                        SpaceBootLogger.log("Ready -> placing wid=\(refreshed.windowId) (\(slot.savedWindow.appName)) onto \(displayName) space[\(spaceIndex)]")
+                        _ = controller.setWindowFrameVerified(
+                            windowId: refreshed.windowId,
+                            pid: refreshed.pid,
+                            frame: slot.savedWindow.frame,
+                            targetSpaceId: targetSpaceId
+                        )
+
+                        // Guard against apps whose splash-transition window closes right after spawning.
+                        if slot.sawSplash,
+                           let replaced = watchForWindowReplacement(
+                               original: refreshed,
+                               expectedFrame: slot.savedWindow.frame,
+                               excluding: waveClaimedIds
+                           ) {
+                            SpaceBootLogger.log("Detected replacement window wid=\(replaced.windowId) for \(slot.savedWindow.appName)")
+                            slot.resolvedWindow = replaced
+                            waveClaimedIds.insert(replaced.windowId)
+                            claimedWindowIds.insert(replaced.windowId)
+                        }
+                        continue
+                    }
+
+                    if !slot.sawSplash && !candidates.isEmpty {
+                        slot.sawSplash = true
+                        slot.deadline = max(slot.deadline, Date().addingTimeInterval(SpaceBootConfig.splashExtendedTimeoutSeconds))
+                        SpaceBootLogger.log("Detected splash/loading window for \(appId); extending wait to \(Int(SpaceBootConfig.splashExtendedTimeoutSeconds))s")
+                    } else if !slot.extendedForProcess && !NSRunningApplication.runningApplications(withBundleIdentifier: appId).isEmpty {
+                        slot.extendedForProcess = true
+                        slot.deadline = max(slot.deadline, Date().addingTimeInterval(SpaceBootConfig.processInitTimeoutSeconds))
+                        SpaceBootLogger.log("App \(appId) process started; waiting up to \(Int(SpaceBootConfig.processInitTimeoutSeconds))s for main window")
+                    }
+                }
+            }
+
+            // Collect resolved & timed-out slots from this wave.
+            for slot in activeSlots {
+                if let win = slot.resolvedWindow {
+                    resolvedAll[slot.savedIndex] = win
+                } else {
+                    SpaceBootLogger.log("Timed out waiting for main window of \(slot.savedWindow.appName); queuing late-arrival watcher")
+                    timedOutAll.append(PendingLateWindow(
+                        appId: slot.savedWindow.appId,
+                        appName: slot.savedWindow.appName,
+                        savedWindow: slot.savedWindow,
+                        targetSpaceId: targetSpaceId,
+                        existingIdsAtLaunch: baselineIds
+                    ))
+                }
+            }
+        }
+
+        return (resolvedAll, timedOutAll)
+    }
+
+    // MARK: - Post-Boot Settle Guard (Catches Electron win.center() After Startup)
+
+    /// Watches newly launched windows for ~15s after boot finishes.
+    /// Handles BOTH:
+    /// 1. Apps that asynchronously reposition themselves (e.g. Electron calling BrowserWindow.center()).
+    /// 2. Apps that close their initial startup window and spawn a brand-new main window ID a few seconds later.
+    private func startPostBootSettleGuard(entries: [SettleGuardEntry], knownWindowIds: Set<Int>) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            var trackedIds = knownWindowIds
+            let deadline = Date().addingTimeInterval(SpaceBootConfig.postBootSettleGuardSeconds)
+
+            while Date() < deadline {
+                usleep(SpaceBootConfig.postBootSettlePollMicros)
+                let displays = self.inspector.listDisplays()
+                let activeSpaceByDisplay = Dictionary(uniqueKeysWithValues: displays.map { ($0.uuid, $0.currentSpaceId) })
+                let visibleSpaces = Set(displays.map { $0.currentSpaceId })
+                let liveWindows = self.inspector.listAllUserWindows()
+
+                for entry in entries {
+                    // Only re-snap when the entry's target Space is currently active on its target display.
+                    guard activeSpaceByDisplay[entry.targetDisplayUUID] == entry.targetSpaceId else {
+                        continue
+                    }
+
+                    // Case A: Original window ID is still alive — check for async drift.
+                    if let live = liveWindows.first(where: { $0.windowId == entry.windowId }) {
+                        let frameOk = live.frame.isApproximatelyEqual(
+                            to: entry.expectedFrame,
+                            tolerance: SpaceBootConfig.frameVerifyTolerancePx
+                        )
+                        let spaceOk = live.spaceIds.contains(entry.targetSpaceId)
+
+                        if !frameOk || !spaceOk {
+                            SpaceBootLogger.log("SettleGuard drift on wid=\(entry.windowId) (\(entry.appName)): got \(live.frame) sp=\(live.spaceIds), restoring -> \(entry.expectedFrame) sp=\(entry.targetSpaceId)")
+                            _ = self.controller.setWindowFrameVerified(
+                                windowId: entry.windowId,
+                                pid: entry.pid,
+                                frame: entry.expectedFrame,
+                                targetSpaceId: entry.targetSpaceId
+                            )
+                            // If OS/app clamped height/width while staying at the right Space & origin, update expectedFrame
+                            // to avoid re-fighting Dock/min-size constraints on subsequent ticks.
+                            if let after = self.inspector.listAllUserWindows().first(where: { $0.windowId == entry.windowId }),
+                               after.spaceIds.contains(entry.targetSpaceId),
+                               abs(after.frame.x - entry.expectedFrame.x) <= SpaceBootConfig.frameVerifyTolerancePx,
+                               abs(after.frame.y - entry.expectedFrame.y) <= SpaceBootConfig.frameVerifyTolerancePx {
+                                entry.expectedFrame = after.frame
+                            }
+                        }
+                        continue
+                    }
+
+                    // Case B: Original startup window disappeared and app spawned a brand-new replacement window ID
+                    // (common in Electron/desktop apps whose preloader window closes and opens the real main window).
+                    if let replacement = liveWindows.first(where: { win in
+                        !trackedIds.contains(win.windowId) &&
+                        win.appId == entry.appId &&
+                        win.spaceIds.contains(where: { visibleSpaces.contains($0) }) &&
+                        self.controller.isLikelyMainWindow(win, expectedFrame: entry.expectedFrame, requireAXMetadata: true)
+                    }) {
+                        SpaceBootLogger.log("SettleGuard adopted replacement wid=\(replacement.windowId) (replacing wid=\(entry.windowId)) for \(entry.appName); moving from \(replacement.frame) sp=\(replacement.spaceIds) -> \(entry.expectedFrame) sp=\(entry.targetSpaceId)")
+                        entry.windowId = replacement.windowId
+                        entry.pid = replacement.pid
+                        trackedIds.insert(replacement.windowId)
+                        _ = self.controller.setWindowFrameVerified(
+                            windowId: replacement.windowId,
+                            pid: replacement.pid,
+                            frame: entry.expectedFrame,
+                            targetSpaceId: entry.targetSpaceId
+                        )
+                        self.controller.raiseWindow(windowId: replacement.windowId, pid: replacement.pid)
+                    }
+                }
+            }
+            SpaceBootLogger.log("SettleGuard completed \(Int(SpaceBootConfig.postBootSettleGuardSeconds))s watch for \(entries.count) window(s)")
+        }
     }
 
     // MARK: - Private Helpers
@@ -430,42 +669,6 @@ final class ProfileManager {
         return claimed
     }
 
-    private func waitForMainWindow(
-        appId: String,
-        expectedFrame: WindowRect,
-        excluding existingIds: Set<Int>
-    ) -> (window: LiveWindowInfo, sawSplash: Bool)? {
-        var deadline = Date().addingTimeInterval(SpaceBootConfig.launchWindowTimeoutSeconds)
-        var extendedForProcess = false
-        var sawSplash = false
-
-        while Date() < deadline {
-            usleep(SpaceBootConfig.launchPollMicros)
-            let candidates = inspector.listAllUserWindows().filter {
-                $0.appId == appId && !existingIds.contains($0.windowId)
-            }
-
-            if let mainWin = candidates.first(where: {
-                controller.isLikelyMainWindow($0, expectedFrame: expectedFrame, requireAXMetadata: true)
-            }) {
-                usleep(350_000)
-                let refreshed = inspector.listAllUserWindows().first(where: { $0.windowId == mainWin.windowId }) ?? mainWin
-                return (refreshed, sawSplash)
-            }
-
-            if !sawSplash && !candidates.isEmpty {
-                sawSplash = true
-                deadline = max(deadline, Date().addingTimeInterval(SpaceBootConfig.splashExtendedTimeoutSeconds))
-                SpaceBootLogger.log("Detected splash/loading window for \(appId); extending wait to \(Int(SpaceBootConfig.splashExtendedTimeoutSeconds))s")
-            } else if !extendedForProcess && !NSRunningApplication.runningApplications(withBundleIdentifier: appId).isEmpty {
-                extendedForProcess = true
-                deadline = max(deadline, Date().addingTimeInterval(SpaceBootConfig.processInitTimeoutSeconds))
-                SpaceBootLogger.log("App \(appId) process started; waiting up to \(Int(SpaceBootConfig.processInitTimeoutSeconds))s for main window")
-            }
-        }
-        return nil
-    }
-
     private func watchForWindowReplacement(
         original: LiveWindowInfo,
         expectedFrame: WindowRect,
@@ -473,12 +676,24 @@ final class ProfileManager {
     ) -> LiveWindowInfo? {
         usleep(SpaceBootConfig.replacementWatchDelayMicros)
         let current = inspector.listAllUserWindows()
-        let stillAlive = current.contains { $0.windowId == original.windowId }
-        if stillAlive { return nil }
+        if current.contains(where: { $0.windowId == original.windowId }) {
+            return nil
+        }
 
         var excluded = existingIds
         excluded.insert(original.windowId)
-        return waitForMainWindow(appId: original.appId, expectedFrame: expectedFrame, excluding: excluded)?.window
+        let deadline = Date().addingTimeInterval(SpaceBootConfig.launchWindowTimeoutSeconds)
+        while Date() < deadline {
+            usleep(SpaceBootConfig.launchPollMicros)
+            if let found = inspector.listAllUserWindows().first(where: {
+                $0.appId == original.appId &&
+                !excluded.contains($0.windowId) &&
+                controller.isLikelyMainWindow($0, expectedFrame: expectedFrame, requireAXMetadata: true)
+            }) {
+                return found
+            }
+        }
+        return nil
     }
 
     private func watchPendingLateWindows(_ pendingList: [PendingLateWindow]) {
