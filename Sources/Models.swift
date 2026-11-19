@@ -120,6 +120,11 @@ struct DisplayLayout: Codable {
     var spaceCount: Int
     var activeSpaceIndex: Int
     var spaces: [SpaceLayout]
+
+    /// Number of Desktop Spaces actually required to host all recorded non-empty spaces on this display.
+    var requiredSpaceCount: Int {
+        spaces.filter { !$0.windows.isEmpty }.map { $0.spaceIndex + 1 }.max() ?? 0
+    }
 }
 
 struct SpaceBootProfile: Codable {
@@ -134,7 +139,7 @@ struct SpaceBootProfile: Codable {
     }
 
     var totalSpaceCount: Int {
-        displays.reduce(0) { $0 + $1.spaceCount }
+        displays.reduce(0) { $0 + $1.requiredSpaceCount }
     }
 }
 

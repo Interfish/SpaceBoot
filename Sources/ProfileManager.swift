@@ -159,9 +159,21 @@ final class ProfileManager {
             })
 
             var spaceLayouts: [SpaceLayout] = []
+            var remappedActiveSpaceIndex = 0
+            let liveActiveIndex = display.currentSpaceIndex ?? 0
+
             for sIdx in 0..<display.desktopSpaceIds.count {
                 let rawWins = buckets[dIdx][sIdx] ?? []
-                let priorSpace = priorDisplay?.spaces.first(where: { $0.spaceIndex == sIdx })
+                // Skip empty Spaces so recorded profiles never require blank placeholder desktops.
+                guard !rawWins.isEmpty else { continue }
+
+                let compactedIdx = spaceLayouts.count
+                if sIdx == liveActiveIndex {
+                    remappedActiveSpaceIndex = compactedIdx
+                }
+
+                let priorSpace = priorDisplay?.spaces.first(where: { $0.spaceIndex == compactedIdx })
+                    ?? priorDisplay?.spaces.first(where: { $0.spaceIndex == sIdx })
                 var usedPriorIndices: Set<Int> = []
 
                 let records: [WindowRecord] = rawWins.enumerated().map { zIdx, win in
@@ -187,14 +199,14 @@ final class ProfileManager {
                     )
                 }
 
-                spaceLayouts.append(SpaceLayout(spaceIndex: sIdx, windows: records))
+                spaceLayouts.append(SpaceLayout(spaceIndex: compactedIdx, windows: records))
             }
 
             displayLayouts.append(DisplayLayout(
                 displayUUID: display.uuid,
                 displayName: display.name,
-                spaceCount: display.desktopSpaceIds.count,
-                activeSpaceIndex: display.currentSpaceIndex ?? 0,
+                spaceCount: spaceLayouts.count,
+                activeSpaceIndex: remappedActiveSpaceIndex,
                 spaces: spaceLayouts
             ))
         }
@@ -248,8 +260,11 @@ final class ProfileManager {
         }
 
         var insufficient: [(String, Int, Int)] = []
-        for pair in displayPairs where pair.live.desktopSpaceIds.count < pair.saved.spaceCount {
-            insufficient.append((pair.saved.displayName, pair.live.desktopSpaceIds.count, pair.saved.spaceCount))
+        for pair in displayPairs {
+            let required = pair.saved.requiredSpaceCount
+            if pair.live.desktopSpaceIds.count < required {
+                insufficient.append((pair.saved.displayName, pair.live.desktopSpaceIds.count, required))
+            }
         }
         if !insufficient.isEmpty {
             throw ProfileActionError.insufficientSpaces(insufficient)
@@ -374,8 +389,10 @@ final class ProfileManager {
                 }
             }
 
-            let finalIndex = min(pair.saved.activeSpaceIndex, max(0, pair.live.desktopSpaceIds.count - 1))
-            _ = controller.switchDisplay(liveUUID, toSpaceIndex: finalIndex)
+            if pair.saved.requiredSpaceCount > 0 {
+                let finalIndex = min(pair.saved.activeSpaceIndex, max(0, pair.live.desktopSpaceIds.count - 1))
+                _ = controller.switchDisplay(liveUUID, toSpaceIndex: finalIndex)
+            }
         }
 
         // Background watchers: catch late-auth apps AND re-snap apps (e.g., Electron) that call window.center() after boot.
