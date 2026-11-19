@@ -108,8 +108,9 @@ final class WindowController {
 
     /// Navigates the specified display to `targetIndex` (0-based desktop Space),
     /// using direct "Switch to Desktop N" shortcut if enabled, otherwise stepping with the user's Move Left/Right shortcut.
+    /// Set `settleForLaunch: false` for fast interactive hotkey switching.
     @discardableResult
-    func switchDisplay(_ displayUUID: String, toSpaceIndex targetIndex: Int) -> Bool {
+    func switchDisplay(_ displayUUID: String, toSpaceIndex targetIndex: Int, settleForLaunch: Bool = true) -> Bool {
         let allDisplays = inspector.listDisplays()
         guard let initialDisplay = allDisplays.first(where: { $0.uuid == displayUUID }),
               targetIndex >= 0, targetIndex < initialDisplay.desktopSpaceIds.count else {
@@ -125,7 +126,12 @@ final class WindowController {
             return true
         }
 
+        // Wait briefly if the user is still holding physical modifier keys (e.g. Option from ⌥1–⌥9)
+        // so synthetic Space shortcuts are not polluted by held modifiers.
+        waitForConflictingModifiersRelease()
+
         let hotKeys = SymbolicHotKeys()
+        let stepSettleMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceAnimationSettleMicros : 160_000
 
         // Fast path: if the user enabled "Switch to Desktop N" in System Settings, jump directly in 1 hop.
         if let globalIdx = globalDesktopIndex(displayUUID: displayUUID, localIndex: targetIndex, in: allDisplays),
@@ -133,7 +139,7 @@ final class WindowController {
             SpaceBootLogger.log("switchDisplay \(initialDisplay.name) direct jump -> global Desktop \(globalIdx + 1) (id=\(targetSpaceId))")
             let prevId = initialDisplay.currentSpaceId
             postShortcut(directShortcut)
-            if waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId),
+            if waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros),
                inspector.listDisplays().first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId {
                 SpaceBootLogger.log("switchDisplay direct jump arrived at \(initialDisplay.name) space[\(targetIndex)]")
                 return true
@@ -155,7 +161,9 @@ final class WindowController {
                 return false
             }
             if live.currentSpaceId == targetSpaceId {
-                usleep(SpaceBootConfig.spaceAnimationSettleMicros)
+                if settleForLaunch {
+                    usleep(SpaceBootConfig.spaceAnimationSettleMicros)
+                }
                 SpaceBootLogger.log("switchDisplay arrived at \(live.name) space[\(targetIndex)] after \(step) step(s)")
                 return true
             }
@@ -163,7 +171,7 @@ final class WindowController {
             focusDisplay(live)
             guard let currentIdx = live.currentSpaceIndex else {
                 postShortcut(leftShortcut)
-                _ = waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: live.currentSpaceId)
+                _ = waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: live.currentSpaceId, settleMicros: stepSettleMicros)
                 continue
             }
 
@@ -171,12 +179,12 @@ final class WindowController {
             let prevId = live.currentSpaceId
             postShortcut(shortcut)
 
-            if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId) {
+            if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
                 SpaceBootLogger.log("switchDisplay step \(step) did not move \(live.name); retrying with desktop focus click")
                 clickSafePointOnDisplay(live)
                 usleep(120_000)
                 postShortcut(shortcut)
-                if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId) {
+                if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
                     SpaceBootLogger.log("switchDisplay FAILED on \(live.name) (still id=\(prevId))")
                     return false
                 }
@@ -185,6 +193,22 @@ final class WindowController {
 
         return inspector.listDisplays()
             .first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId
+    }
+
+    /// Switches directly to a 0-based global desktop index across connected displays (used by ⌥1–⌥9 hotkeys).
+    @discardableResult
+    func switchToGlobalDesktop(index globalIndex: Int) -> Bool {
+        let displays = inspector.listDisplays()
+        var offset = 0
+        for display in displays {
+            let count = display.desktopSpaceIds.count
+            if globalIndex >= offset && globalIndex < offset + count {
+                let localIdx = globalIndex - offset
+                return switchDisplay(display.uuid, toSpaceIndex: localIdx, settleForLaunch: false)
+            }
+            offset += count
+        }
+        return false
     }
 
     /// Moves pointer and transfers active-display focus to `display` so Space navigation and new windows target it.
@@ -375,13 +399,25 @@ final class WindowController {
         keyUp.post(tap: .cghidEventTap)
     }
 
-    private func waitForSpaceChange(displayUUID: String, previousSpaceId: Int) -> Bool {
+    private func waitForConflictingModifiersRelease() {
+        let conflicting: CGEventFlags = [.maskAlternate, .maskCommand, .maskShift]
+        let deadline = Date().addingTimeInterval(0.45)
+        while Date() < deadline {
+            let current = CGEventSource.flagsState(.hidSystemState)
+            if current.intersection(conflicting).isEmpty {
+                return
+            }
+            usleep(15_000)
+        }
+    }
+
+    private func waitForSpaceChange(displayUUID: String, previousSpaceId: Int, settleMicros: useconds_t) -> Bool {
         let deadline = Date().addingTimeInterval(SpaceBootConfig.spaceSwitchTimeoutSeconds)
         while Date() < deadline {
             usleep(SpaceBootConfig.spaceSwitchPollMicros)
             if let live = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
                live.currentSpaceId != previousSpaceId {
-                usleep(SpaceBootConfig.spaceAnimationSettleMicros)
+                usleep(settleMicros)
                 return true
             }
         }

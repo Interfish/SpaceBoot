@@ -3,12 +3,29 @@ import ApplicationServices
 import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private static let hotKeysPrefKey = "SpaceBootGlobalHotKeysEnabled"
+
     private let inspector = SpaceInspector()
     private lazy var controller = WindowController(inspector: inspector)
     private lazy var profileManager = ProfileManager(inspector: inspector, controller: controller)
+    private let hotKeyManager = HotKeyManager()
+    private let interactiveSwitchQueue = DispatchQueue(label: "com.spaceboot.interactive-switch", qos: .userInteractive)
 
     private var statusItem: NSStatusItem!
     private var isBusy = false
+    private var isSwitchingSpace = false
+
+    private var hotKeysEnabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: Self.hotKeysPrefKey) == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: Self.hotKeysPrefKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: Self.hotKeysPrefKey)
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -20,6 +37,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         SpaceBootLogger.log("SpaceBoot launched. AXIsProcessTrusted=\(AXIsProcessTrusted())")
         registerDistributedCommands()
+        syncHotKeysState()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        hotKeyManager.unregister()
+    }
+
+    // MARK: - Runtime Global Hotkeys (Option+1..9 & Option+Shift+B)
+
+    private func syncHotKeysState() {
+        if hotKeysEnabled {
+            hotKeyManager.register { [weak self] action in
+                self?.handleHotKeyAction(action)
+            }
+        } else {
+            hotKeyManager.unregister()
+        }
+    }
+
+    private func handleHotKeyAction(_ action: HotKeyAction) {
+        guard !isBusy else { return }
+
+        switch action {
+        case .switchDesktop(let globalIndex):
+            guard !isSwitchingSpace else { return }
+            isSwitchingSpace = true
+            interactiveSwitchQueue.async { [weak self] in
+                defer {
+                    DispatchQueue.main.async { self?.isSwitchingSpace = false }
+                }
+                guard let self = self else { return }
+                if !AXIsProcessTrusted() {
+                    SpaceBootLogger.log("Hotkey ⌥\(globalIndex + 1) ignored: AXIsProcessTrusted is false")
+                    return
+                }
+                _ = self.controller.switchToGlobalDesktop(index: globalIndex)
+            }
+
+        case .bootMatchingProfile:
+            let liveDisplays = inspector.listDisplays()
+            let profiles = profileManager.listProfiles()
+            if let matching = profiles.first(where: { profile in
+                profile.displays.count == liveDisplays.count &&
+                profile.displays.allSatisfy { inspector.matchLiveDisplay(for: $0, in: liveDisplays) != nil }
+            }) ?? profiles.first(where: { profile in
+                profile.displays.allSatisfy { inspector.matchLiveDisplay(for: $0, in: liveDisplays) != nil }
+            }) {
+                SpaceBootLogger.log("Hotkey ⌥⇧B booting matched profile '\(matching.name)'")
+                performApply(named: matching.name, launchMissing: true, silentErrors: false)
+            } else {
+                sendNotification(title: "SpaceBoot", body: "No saved profile matches the currently connected displays.")
+            }
+        }
     }
 
     // MARK: - Distributed Notification IPC (for CLI / automation triggers)
@@ -37,24 +107,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let payload = notification.object as? String else { return }
         let parts = payload.split(separator: ":", maxSplits: 1).map(String.init)
         let action = parts[0]
-        let profileName = parts.count > 1 ? parts[1] : ""
+        let arg = parts.count > 1 ? parts[1] : ""
 
-        SpaceBootLogger.log("IPC command received: action=\(action) profile=\(profileName)")
+        SpaceBootLogger.log("IPC command received: action=\(action) arg=\(arg)")
 
         switch action {
         case "inspect":
             DispatchQueue.global(qos: .userInitiated).async {
                 self.profileManager.dumpDiagnostics()
             }
+        case "switch":
+            if let oneBased = Int(arg), oneBased >= 1 {
+                handleHotKeyAction(.switchDesktop(globalIndex: oneBased - 1))
+            }
         case "record":
-            guard !profileName.isEmpty else { return }
-            performRecord(named: profileName)
+            guard !arg.isEmpty else { return }
+            performRecord(named: arg)
         case "boot":
-            guard !profileName.isEmpty else { return }
-            performApply(named: profileName, launchMissing: true, silentErrors: true)
+            guard !arg.isEmpty else { return }
+            performApply(named: arg, launchMissing: true, silentErrors: true)
         case "restore":
-            guard !profileName.isEmpty else { return }
-            performApply(named: profileName, launchMissing: false, silentErrors: true)
+            guard !arg.isEmpty else { return }
+            performApply(named: arg, launchMissing: false, silentErrors: true)
         default:
             break
         }
@@ -76,17 +150,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             header.isEnabled = false
             menu.addItem(header)
 
+            var globalDesktopNumber = 1
             for d in liveDisplays {
-                let activeIdx = (d.currentSpaceIndex ?? 0) + 1
-                let count = d.desktopSpaceIds.count
-                let spaceWord = count == 1 ? "Space" : "Spaces"
-                let info = NSMenuItem(
-                    title: "  \(d.name): \(count) \(spaceWord) (Desktop \(activeIdx))",
-                    action: nil,
-                    keyEquivalent: ""
-                )
-                info.isEnabled = false
-                menu.addItem(info)
+                let displayHeader = NSMenuItem(title: "  \(d.name)", action: nil, keyEquivalent: "")
+                displayHeader.isEnabled = false
+                menu.addItem(displayHeader)
+
+                for (localIdx, spaceId) in d.desktopSpaceIds.enumerated() {
+                    let isCurrent = (spaceId == d.currentSpaceId)
+                    let marker = isCurrent ? "●" : "○"
+                    let keyHint = (hotKeysEnabled && globalDesktopNumber <= 9) ? "\(globalDesktopNumber)" : ""
+                    let item = NSMenuItem(
+                        title: "    \(marker) Desktop \(globalDesktopNumber) (Space \(localIdx + 1))",
+                        action: #selector(handleSwitchDesktopMenu(_:)),
+                        keyEquivalent: keyHint
+                    )
+                    if !keyHint.isEmpty {
+                        item.keyEquivalentModifierMask = .option
+                    }
+                    item.tag = globalDesktopNumber - 1
+                    item.target = self
+                    item.isEnabled = !isBusy
+                    menu.addItem(item)
+                    globalDesktopNumber += 1
+                }
             }
         }
 
@@ -156,6 +243,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         newItem.isEnabled = !isBusy
         menu.addItem(newItem)
 
+        let hotKeyToggle = NSMenuItem(
+            title: "Global Hotkeys (⌥1–⌥9 Switch · ⌥⇧B Boot)",
+            action: #selector(handleToggleHotKeys),
+            keyEquivalent: ""
+        )
+        hotKeyToggle.target = self
+        hotKeyToggle.state = hotKeysEnabled ? .on : .off
+        menu.addItem(hotKeyToggle)
+
         menu.addItem(.separator())
 
         if !AXIsProcessTrusted() {
@@ -184,6 +280,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: - Actions
+
+    @objc private func handleSwitchDesktopMenu(_ sender: NSMenuItem) {
+        handleHotKeyAction(.switchDesktop(globalIndex: sender.tag))
+    }
+
+    @objc private func handleToggleHotKeys() {
+        hotKeysEnabled.toggle()
+        syncHotKeysState()
+    }
 
     @objc private func handleNewProfile() {
         NSApp.activate()
@@ -254,9 +359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         1. Automatically rearrange Spaces based on most recent use (keeps Desktop 1/2/3 order fixed)
         2. When switching to an application, switch to a Space with open windows (keeps new browser windows on the active Space)
 
-        Optional tips:
+        Optional tip:
         • Enable "Reduce motion" in System Settings → Accessibility → Display for faster Space transitions.
-        • Bind Option+1/2/3/4 in System Settings → Keyboard Shortcuts → Mission Control.
         """
         alert.addButton(withTitle: "Apply & Restart Dock")
         alert.addButton(withTitle: "Open Display Accessibility")
@@ -290,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func handleQuit() {
+        hotKeyManager.unregister()
         NSApplication.shared.terminate(nil)
     }
 

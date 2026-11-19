@@ -11,6 +11,7 @@ swiftc -O \
   "$SCRIPT_DIR/Sources/Logger.swift" \
   "$SCRIPT_DIR/Sources/Models.swift" \
   "$SCRIPT_DIR/Sources/SymbolicHotKeys.swift" \
+  "$SCRIPT_DIR/Sources/HotKeyManager.swift" \
   "$SCRIPT_DIR/Sources/AppLauncher.swift" \
   "$SCRIPT_DIR/Sources/SpaceInspector.swift" \
   "$SCRIPT_DIR/Sources/WindowController.swift" \
