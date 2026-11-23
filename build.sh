@@ -16,6 +16,7 @@ swiftc -O \
   "$SCRIPT_DIR/Sources/AppLauncher.swift" \
   "$SCRIPT_DIR/Sources/SpaceInspector.swift" \
   "$SCRIPT_DIR/Sources/WindowController.swift" \
+  "$SCRIPT_DIR/Sources/BootSession.swift" \
   "$SCRIPT_DIR/Sources/ProfileManager.swift" \
   "$SCRIPT_DIR/Sources/AppDelegate.swift" \
   "$SCRIPT_DIR/Sources/main.swift" \

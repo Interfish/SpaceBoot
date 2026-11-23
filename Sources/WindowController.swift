@@ -11,9 +11,19 @@ func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePoin
 final class WindowController {
     private let inspector: SpaceInspector
     private var loggedFilteredWindowIds: Set<Int> = []
+    private let logFilterLock = NSLock()
+    /// Serializes every Space switch and multi-step window move: while one window is being placed,
+    /// nothing else (boot executor or ⌥ hotkeys) may switch Spaces.
+    private let spaceLock = NSRecursiveLock()
 
     init(inspector: SpaceInspector) {
         self.inspector = inspector
+    }
+
+    func withSpaceLock<T>(_ body: () throws -> T) rethrows -> T {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+        return try body()
     }
 
     // MARK: - AX Window Introspection
@@ -140,6 +150,9 @@ final class WindowController {
     /// Set `settleForLaunch: false` for fast interactive hotkey switching.
     @discardableResult
     func switchDisplay(_ displayUUID: String, toSpaceIndex targetIndex: Int, settleForLaunch: Bool = true) -> Bool {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+
         let allDisplays = inspector.listDisplays()
         guard let initialDisplay = allDisplays.first(where: { $0.uuid == displayUUID }),
               targetIndex >= 0, targetIndex < initialDisplay.desktopSpaceIds.count else {
@@ -148,19 +161,30 @@ final class WindowController {
         }
 
         let targetSpaceId = initialDisplay.desktopSpaceIds[targetIndex]
-        focusDisplay(initialDisplay)
+        // ⌥N switches skip refocusing when cursor and keyboard focus already sit on this display (the usual case
+        // when flipping through one monitor's Spaces), so the Space shortcut goes out the moment ⌥N is pressed.
+        if settleForLaunch || !displayHasInputFocus(initialDisplay) {
+            focusDisplay(initialDisplay)
+        }
 
         if initialDisplay.currentSpaceId == targetSpaceId {
             SpaceBootLogger.log("switchDisplay \(initialDisplay.name) already on space[\(targetIndex)] (id=\(targetSpaceId))")
             return true
         }
 
-        // Wait briefly if the user is still holding physical modifier keys (e.g. Option from ⌥1–⌥9)
-        // so synthetic Space shortcuts are not polluted by held modifiers.
-        waitForConflictingModifiersRelease()
+        // Boots wait briefly for held modifier keys so synthetic Space shortcuts are not polluted by them.
+        // ⌥N switches don't: logs showed every shortcut posted with ⌥ still held landing fine, while the wait
+        // delayed the start of each ⌥-held switch by ~0.46s.
+        if settleForLaunch {
+            let modifierWaitMs = waitForConflictingModifiersRelease()
+            if modifierWaitMs > 0 {
+                SpaceBootLogger.log("switchDisplay waited \(modifierWaitMs)ms for ⌥/⌘/⇧ to be released")
+            }
+        }
 
         let hotKeys = SymbolicHotKeys()
-        let stepSettleMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceAnimationSettleMicros : 160_000
+        let stepSettleMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceAnimationSettleMicros : SpaceBootConfig.interactiveSettleMicros
+        let pollMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceSwitchPollMicros : SpaceBootConfig.interactivePollMicros
 
         // Fast path: if the user enabled "Switch to Desktop N" in System Settings, jump directly in 1 hop
         // (no stepping through intermediate spaces, no focus dependency).
@@ -169,7 +193,7 @@ final class WindowController {
             SpaceBootLogger.log("switchDisplay \(initialDisplay.name) direct jump -> global Desktop \(globalIdx + 1) (id=\(targetSpaceId))")
             let prevId = initialDisplay.currentSpaceId
             postShortcut(directShortcut)
-            if waitForSpaceArrival(displayUUID: displayUUID, targetSpaceId: targetSpaceId, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
+            if waitForSpaceArrival(displayUUID: displayUUID, targetSpaceId: targetSpaceId, previousSpaceId: prevId, settleMicros: stepSettleMicros, pollMicros: pollMicros) {
                 SpaceBootLogger.log("switchDisplay direct jump arrived at \(initialDisplay.name) space[\(targetIndex)]")
                 return true
             }
@@ -196,7 +220,7 @@ final class WindowController {
                     if i > 0 { usleep(75_000) }
                     postShortcut(burstShortcut)
                 }
-                if waitForSpaceArrival(displayUUID: displayUUID, targetSpaceId: targetSpaceId, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
+                if waitForSpaceArrival(displayUUID: displayUUID, targetSpaceId: targetSpaceId, previousSpaceId: prevId, settleMicros: stepSettleMicros, pollMicros: pollMicros) {
                     SpaceBootLogger.log("switchDisplay burst arrived at \(initialDisplay.name) space[\(targetIndex)] in \(steps) coalesced step(s)")
                     return true
                 }
@@ -216,10 +240,12 @@ final class WindowController {
                 return true
             }
 
-            focusDisplay(live)
+            if settleForLaunch || !displayHasInputFocus(live) {
+                focusDisplay(live)
+            }
             guard let currentIdx = live.currentSpaceIndex else {
                 postShortcut(leftShortcut)
-                _ = waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: live.currentSpaceId, settleMicros: stepSettleMicros)
+                _ = waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: live.currentSpaceId, settleMicros: stepSettleMicros, pollMicros: pollMicros)
                 continue
             }
 
@@ -227,12 +253,12 @@ final class WindowController {
             let prevId = live.currentSpaceId
             postShortcut(shortcut)
 
-            if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
+            if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros, pollMicros: pollMicros) {
                 SpaceBootLogger.log("switchDisplay step \(step) did not move \(live.name); retrying with desktop focus click")
                 clickSafePointOnDisplay(live)
                 usleep(120_000)
                 postShortcut(shortcut)
-                if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros) {
+                if !waitForSpaceChange(displayUUID: displayUUID, previousSpaceId: prevId, settleMicros: stepSettleMicros, pollMicros: pollMicros) {
                     SpaceBootLogger.log("switchDisplay FAILED on \(live.name) (still id=\(prevId))")
                     return false
                 }
@@ -243,10 +269,140 @@ final class WindowController {
             .first(where: { $0.uuid == displayUUID })?.currentSpaceId == targetSpaceId
     }
 
+    /// Switches `displayUUID` to the Space with ID `spaceId`, wherever macOS currently orders it.
+    @discardableResult
+    func switchDisplay(_ displayUUID: String, toSpaceId spaceId: Int, settleForLaunch: Bool = true) -> Bool {
+        guard let display = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+              let index = display.desktopSpaceIds.firstIndex(of: spaceId) else {
+            SpaceBootLogger.log("switchDisplay: Space id=\(spaceId) no longer exists on display \(displayUUID)")
+            return false
+        }
+        return switchDisplay(displayUUID, toSpaceIndex: index, settleForLaunch: settleForLaunch)
+    }
+
+    /// Like `switchDisplay(_:toSpaceId:)`, but leaves focus and cursor alone when the Space is already visible.
+    @discardableResult
+    func ensureSpaceVisible(displayUUID: String, spaceId: Int) -> Bool {
+        if inspector.listDisplays().first(where: { $0.uuid == displayUUID })?.currentSpaceId == spaceId {
+            return true
+        }
+        return switchDisplay(displayUUID, toSpaceId: spaceId)
+    }
+
+    /// Shows the Space hosting `windowId` on its display (Accessibility only reaches windows on visible Spaces).
+    @discardableResult
+    func revealSpace(ofWindow windowId: Int) -> Bool {
+        let spaceIds = inspector.spaceIds(forWindow: windowId)
+        guard let display = inspector.listDisplays().first(where: { d in spaceIds.contains(where: d.desktopSpaceIds.contains) }),
+              let spaceId = spaceIds.first(where: display.desktopSpaceIds.contains) else {
+            return false
+        }
+        return ensureSpaceVisible(displayUUID: display.uuid, spaceId: spaceId)
+    }
+
     /// Switches directly to a specific Space slot key (used by customizable ⌥1–⌥9 hotkeys).
     @discardableResult
     func switchToSlot(_ key: SpaceSlotKey) -> Bool {
         switchDisplay(key.displayUUID, toSpaceIndex: key.spaceIndex, settleForLaunch: false)
+    }
+
+    // MARK: - Cross-Space Relocation
+
+    /// Puts a window on Space `targetSpaceId` of `targetDisplayUUID` at `frame`, wherever it currently is.
+    /// Returns true once the window is on the target Space (frame drift is left to the caller's settle guard).
+    ///
+    /// macOS has no public API to move a window between Spaces (minimize → switch → restore puts it back on its
+    /// original Space). But WindowServer reliably assigns a window that is moved onto another display to that
+    /// display's *current* Space, so:
+    /// - target on another display: show the target Space there, then move the window across;
+    /// - target on the same display: park the window on a helper display, switch its own display, move it back.
+    @discardableResult
+    func relocateWindow(windowId: Int, pid: pid_t, frame: WindowRect, targetDisplayUUID: String, targetSpaceId: Int) -> Bool {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+        let restoreEnhancedUI = disableEnhancedUserInterface(pid: pid)
+        defer { restoreEnhancedUI() }
+
+        guard AXIsProcessTrusted(),
+              let live = inspector.listAllUserWindows().first(where: { $0.windowId == windowId }) else {
+            return false
+        }
+        let displays = inspector.listDisplays()
+        guard let source = displays.first(where: { d in live.spaceIds.contains(where: d.desktopSpaceIds.contains) }),
+              let sourceSpaceId = live.spaceIds.first(where: source.desktopSpaceIds.contains) else {
+            SpaceBootLogger.log("Relocate: cannot find the Desktop Space of wid=\(windowId) (\(live.appName)) sp=\(live.spaceIds)")
+            return false
+        }
+
+        if sourceSpaceId == targetSpaceId {
+            guard ensureSpaceVisible(displayUUID: targetDisplayUUID, spaceId: targetSpaceId) else { return false }
+            setWindowFrameVerified(windowId: windowId, pid: pid, frame: frame, targetSpaceId: targetSpaceId)
+            return isWindow(windowId, onSpace: targetSpaceId)
+        }
+
+        let sameDisplay = source.uuid == targetDisplayUUID
+        let helper = displays.first(where: {
+            $0.uuid != source.uuid && $0.cgFrame.width > 0 && $0.desktopSpaceIds.contains($0.currentSpaceId)
+        })
+        if sameDisplay && helper == nil {
+            SpaceBootLogger.log("Relocate wid=\(windowId) (\(live.appName)): no second display to bounce through; it stays on sp=\(sourceSpaceId)")
+            return false
+        }
+
+        guard ensureSpaceVisible(displayUUID: source.uuid, spaceId: sourceSpaceId) else { return false }
+
+        guard sameDisplay, let helper else {
+            guard ensureSpaceVisible(displayUUID: targetDisplayUUID, spaceId: targetSpaceId) else { return false }
+            setWindowFrameVerified(windowId: windowId, pid: pid, frame: frame, targetSpaceId: targetSpaceId)
+            let ok = isWindow(windowId, onSpace: targetSpaceId)
+            SpaceBootLogger.log("Relocate wid=\(windowId) (\(live.appName)) sp=\(sourceSpaceId) -> sp=\(targetSpaceId) across displays: \(ok ? "ok" : "FAILED")")
+            return ok
+        }
+
+        guard moveWindow(windowId, pid: pid, to: parkingFrame(for: live.frame, on: helper), joining: helper.currentSpaceId, sizeFirst: true) else {
+            SpaceBootLogger.log("Relocate wid=\(windowId) (\(live.appName)): did not join helper display \(helper.name) (\(describeWindow(windowId))); putting it back")
+            putBack(windowId: windowId, pid: pid, frame: live.frame, spaceId: sourceSpaceId)
+            return false
+        }
+        guard ensureSpaceVisible(displayUUID: targetDisplayUUID, spaceId: targetSpaceId) else {
+            // Its own display did not switch, so moving it back returns it to where it was.
+            putBack(windowId: windowId, pid: pid, frame: live.frame, spaceId: sourceSpaceId)
+            return false
+        }
+        setWindowFrameVerified(windowId: windowId, pid: pid, frame: frame, targetSpaceId: targetSpaceId)
+        if !isWindow(windowId, onSpace: targetSpaceId) {
+            // The app resisted the final move; anywhere on its own display (now showing the target Space) still lands it there.
+            putBack(windowId: windowId, pid: pid, frame: live.frame, spaceId: targetSpaceId)
+        }
+        let ok = isWindow(windowId, onSpace: targetSpaceId)
+        SpaceBootLogger.log("Relocate wid=\(windowId) (\(live.appName)) sp=\(sourceSpaceId) -> sp=\(targetSpaceId) via \(helper.name): \(ok ? "ok" : "FAILED")")
+        return ok
+    }
+
+    /// True if both the cursor and the focused window are on `display`, so Space shortcuts already act on it.
+    private func displayHasInputFocus(_ display: LiveDisplayInfo) -> Bool {
+        guard let cursor = CGEvent(source: nil)?.location, display.cgFrame.contains(cursor) else { return false }
+
+        var appRef: CFTypeRef?
+        var windowRef: CFTypeRef?
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &appRef) == .success,
+              let app = appRef,
+              AXUIElementCopyAttributeValue(app as! AXUIElement, kAXFocusedWindowAttribute as CFString, &windowRef) == .success,
+              let window = windowRef,
+              AXUIElementCopyAttributeValue(window as! AXUIElement, kAXPositionAttribute as CFString, &posRef) == .success,
+              AXUIElementCopyAttributeValue(window as! AXUIElement, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let posValue = posRef, let sizeValue = sizeRef else {
+            return false
+        }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posValue as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+            return false
+        }
+        return display.cgFrame.contains(CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2))
     }
 
     /// Transfers active-display focus to `display` so Space navigation and new windows target it.
@@ -278,6 +434,8 @@ final class WindowController {
     @discardableResult
     func setWindowFrameVerified(windowId: Int, pid: pid_t, frame: WindowRect, targetSpaceId: Int? = nil) -> Bool {
         guard AXIsProcessTrusted() else { return false }
+        let restoreEnhancedUI = disableEnhancedUserInterface(pid: pid)
+        defer { restoreEnhancedUI() }
 
         var previousRect: WindowRect?
 
@@ -337,7 +495,7 @@ final class WindowController {
         return nil
     }
 
-    private func applyAXFrameOnce(windowId: Int, pid: pid_t, frame: WindowRect) -> Bool {
+    private func applyAXFrameOnce(windowId: Int, pid: pid_t, frame: WindowRect, sizeFirst: Bool = false) -> Bool {
         guard let axWindow = findAXWindow(windowId: windowId, pid: pid) else { return false }
 
         var origin = CGPoint(x: frame.x, y: frame.y)
@@ -350,7 +508,15 @@ final class WindowController {
             return false
         }
 
-        // Move to target display FIRST, then resize, then re-apply position & size to prevent cross-display clamping.
+        // Default: move to the target display FIRST, then resize, then re-apply both to prevent cross-display clamping.
+        // `sizeFirst` shrinks before moving instead, for a big window heading to a smaller display.
+        if sizeFirst {
+            let s1 = AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeVal1)
+            let p1 = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posVal1)
+            let s2 = AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeVal2)
+            let p2 = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posVal2)
+            return (p1 == .success || p2 == .success) && (s1 == .success || s2 == .success)
+        }
         let p1 = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posVal1)
         let s1 = AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeVal1)
         let p2 = AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posVal2)
@@ -384,9 +550,83 @@ final class WindowController {
     }
 
     private func logFilterOnce(_ windowId: Int, _ message: String) {
-        if loggedFilteredWindowIds.insert(windowId).inserted {
+        logFilterLock.lock()
+        let isFirst = loggedFilteredWindowIds.insert(windowId).inserted
+        logFilterLock.unlock()
+        if isFirst {
             SpaceBootLogger.log(message)
         }
+    }
+
+    /// A frame fully inside `display` (shrunk if needed) so the parked window unambiguously belongs to it.
+    private func parkingFrame(for frame: WindowRect, on display: LiveDisplayInfo) -> WindowRect {
+        let inset = 60.0
+        return WindowRect(
+            x: Int(display.cgFrame.minX + inset),
+            y: Int(display.cgFrame.minY + inset),
+            width: min(frame.width, Int(max(400, display.cgFrame.width - inset * 2))),
+            height: min(frame.height, Int(max(300, display.cgFrame.height - inset * 2)))
+        )
+    }
+
+    private func isWindow(_ windowId: Int, onSpace spaceId: Int) -> Bool {
+        inspector.spaceIds(forWindow: windowId).contains(spaceId)
+    }
+
+    /// Moves a window to `frame` and confirms it joined `spaceId`, so a failed bounce never strands it on the helper display.
+    private func putBack(windowId: Int, pid: pid_t, frame: WindowRect, spaceId: Int) {
+        if !moveWindow(windowId, pid: pid, to: frame, joining: spaceId, sizeFirst: false) {
+            SpaceBootLogger.log("Relocate: wid=\(windowId) could not be moved back onto sp=\(spaceId) (\(describeWindow(windowId)))")
+        }
+    }
+
+    /// Applies `frame` until the window shows up on `spaceId`. Chromium/Electron windows often ignore the first
+    /// cross-display move (Chrome needed 2–3 tries in the logs), so the frame is re-applied until it sticks.
+    private func moveWindow(_ windowId: Int, pid: pid_t, to frame: WindowRect, joining spaceId: Int, sizeFirst: Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(SpaceBootConfig.relocationJoinTimeoutSeconds)
+        var attempts = 0
+        var lastSetOk = false
+        repeat {
+            attempts += 1
+            lastSetOk = applyAXFrameOnce(windowId: windowId, pid: pid, frame: frame, sizeFirst: sizeFirst)
+            if waitForWindow(windowId, toJoinSpace: spaceId, timeout: 0.4) {
+                if attempts > 1 {
+                    SpaceBootLogger.log("Relocate: wid=\(windowId) joined sp=\(spaceId) on attempt \(attempts)")
+                }
+                return true
+            }
+        } while Date() < deadline
+        SpaceBootLogger.log("Relocate: wid=\(windowId) still not on sp=\(spaceId) after \(attempts) attempt(s) (last AX set \(lastSetOk ? "accepted" : "failed"))")
+        return false
+    }
+
+    private func describeWindow(_ windowId: Int) -> String {
+        let frame = inspector.listAllUserWindows().first(where: { $0.windowId == windowId }).map { "\($0.frame)" } ?? "not listed"
+        return "now \(frame) sp=\(inspector.spaceIds(forWindow: windowId))"
+    }
+
+    /// Chromium/Electron apps animate — and may drop — frame changes while "AXEnhancedUserInterface" is on (some
+    /// accessibility tools turn it on), so, like other window managers, switch it off around a move. Returns the undo.
+    private func disableEnhancedUserInterface(pid: pid_t) -> () -> Void {
+        let app = AXUIElementCreateApplication(pid)
+        let attribute = "AXEnhancedUserInterface" as CFString
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, attribute, &value) == .success, (value as? Bool) == true else {
+            return {}
+        }
+        AXUIElementSetAttributeValue(app, attribute, kCFBooleanFalse)
+        return { AXUIElementSetAttributeValue(app, attribute, kCFBooleanTrue) }
+    }
+
+    private func waitForWindow(_ windowId: Int, toJoinSpace spaceId: Int, timeout: TimeInterval = SpaceBootConfig.relocationJoinTimeoutSeconds) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if inspector.spaceIds(forWindow: windowId).contains(spaceId) {
+                return true
+            }
+            usleep(50_000)
+        }
+        return false
     }
 
     private func moveMouse(to point: CGPoint) {
@@ -441,27 +681,27 @@ final class WindowController {
         keyUp.post(tap: .cghidEventTap)
     }
 
-    private func waitForConflictingModifiersRelease() {
+    /// Returns how many milliseconds it waited (0 if no conflicting modifier was held).
+    private func waitForConflictingModifiersRelease() -> Int {
         let conflicting: CGEventFlags = [.maskAlternate, .maskCommand, .maskShift]
-        let deadline = Date().addingTimeInterval(0.45)
-        while Date() < deadline {
-            let current = CGEventSource.flagsState(.hidSystemState)
-            if current.intersection(conflicting).isEmpty {
-                return
-            }
+        let start = Date()
+        let deadline = start.addingTimeInterval(0.45)
+        while Date() < deadline, !CGEventSource.flagsState(.hidSystemState).intersection(conflicting).isEmpty {
             usleep(15_000)
         }
+        return Int(Date().timeIntervalSince(start) * 1000)
     }
 
     private func waitForSpaceArrival(
         displayUUID: String,
         targetSpaceId: Int,
         previousSpaceId: Int,
-        settleMicros: useconds_t
+        settleMicros: useconds_t,
+        pollMicros: useconds_t = SpaceBootConfig.spaceSwitchPollMicros
     ) -> Bool {
         let deadline = Date().addingTimeInterval(SpaceBootConfig.spaceSwitchTimeoutSeconds)
         while Date() < deadline {
-            usleep(SpaceBootConfig.spaceSwitchPollMicros)
+            usleep(pollMicros)
             if let live = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
                live.currentSpaceId == targetSpaceId {
                 usleep(settleMicros)
@@ -471,10 +711,15 @@ final class WindowController {
         return false
     }
 
-    private func waitForSpaceChange(displayUUID: String, previousSpaceId: Int, settleMicros: useconds_t) -> Bool {
+    private func waitForSpaceChange(
+        displayUUID: String,
+        previousSpaceId: Int,
+        settleMicros: useconds_t,
+        pollMicros: useconds_t = SpaceBootConfig.spaceSwitchPollMicros
+    ) -> Bool {
         let deadline = Date().addingTimeInterval(SpaceBootConfig.spaceSwitchTimeoutSeconds)
         while Date() < deadline {
-            usleep(SpaceBootConfig.spaceSwitchPollMicros)
+            usleep(pollMicros)
             if let live = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
                live.currentSpaceId != previousSpaceId {
                 usleep(settleMicros)

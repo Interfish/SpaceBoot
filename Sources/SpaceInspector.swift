@@ -145,6 +145,12 @@ final class SpaceInspector {
         return windows
     }
 
+    /// Space IDs hosting `windowId`; empty once the window is closed (minimized windows keep their Space).
+    func spaceIds(forWindow windowId: Int) -> [Int] {
+        guard let copyWinSpaces = copySpacesForWindows else { return [] }
+        return copyWinSpaces(connectionId, 0x7, [windowId] as CFArray) as? [Int] ?? []
+    }
+
     /// Finds the active display matching a saved display layout (UUID first, then name fallback).
     func matchLiveDisplay(for saved: DisplayLayout, in liveDisplays: [LiveDisplayInfo]) -> LiveDisplayInfo? {
         if let exact = liveDisplays.first(where: { $0.uuid == saved.displayUUID }) {

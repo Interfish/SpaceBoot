@@ -5,10 +5,17 @@ enum SpaceBootLogger {
     static let logFilePath = "\(NSHomeDirectory())/.config/spaceboot/spaceboot.log"
     private static let maxLogBytes: UInt64 = 512 * 1024
     private static let queue = DispatchQueue(label: "com.spaceboot.logger")
+    /// Millisecond timestamps, so switch and boot timings can be read straight from the log. Only used on `queue`.
+    private static let timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 
     static func log(_ message: String) {
+        let now = Date()
         queue.async {
-            let timestamp = ISO8601DateFormatter().string(from: Date())
+            let timestamp = timestampFormatter.string(from: now)
             let line = "[\(timestamp)] \(message)\n"
             let url = URL(fileURLWithPath: logFilePath)
 

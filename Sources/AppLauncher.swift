@@ -43,6 +43,37 @@ final class AppLauncher {
         "window", "窗口", "視窗", "ウインドウ", "fenster", "fenêtre", "ventana", "창"
     ]
 
+    /// True if `spec` starts a regular app bundle (as opposed to a shell command).
+    static func isAppBundleLaunch(_ spec: LaunchConfig) -> Bool {
+        ["app", "chrome_new_window", "cursor_new_window"].contains(spec.kind)
+    }
+
+    /// Cold-starts the app behind `spec` without activating it, unless it is already running.
+    /// Background launches keep a starting app from grabbing focus while SpaceBoot is switching Spaces.
+    /// Returns nil when there was nothing to launch (already running, or a shell-command spec).
+    func coldLaunchIfNeeded(appId: String, spec: LaunchConfig) -> LaunchAttemptOutcome? {
+        let appPath: String
+        var url: String?
+        switch spec.kind {
+        case "app":
+            appPath = spec.target
+            url = spec.url
+        case "chrome_new_window":
+            appPath = "/Applications/Google Chrome.app"
+            url = spec.target
+        case "cursor_new_window":
+            appPath = "/Applications/Cursor.app"
+        default:
+            return nil
+        }
+
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: appId).isEmpty else { return nil }
+        guard let appURL = resolveApplicationURL(appId: appId, preferredPath: appPath) else {
+            return .failed("Application not found for \(appId) (\(appPath))")
+        }
+        return coldLaunchViaLaunchServices(appURL: appURL, optionalURL: url, activates: false)
+    }
+
     /// Launches a missing window for `appId` using `spec`.
     func launchWindow(appId: String, spec: LaunchConfig, appAlreadyHasWindow: Bool) -> LaunchAttemptOutcome {
         switch spec.kind {
@@ -131,9 +162,9 @@ final class AppLauncher {
         return coldLaunchViaLaunchServices(appURL: appURL, optionalURL: optionalURL)
     }
 
-    private func coldLaunchViaLaunchServices(appURL: URL, optionalURL: String?) -> LaunchAttemptOutcome {
+    private func coldLaunchViaLaunchServices(appURL: URL, optionalURL: String?, activates: Bool = true) -> LaunchAttemptOutcome {
         let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
+        config.activates = activates
 
         if let urlStr = optionalURL?.trimmingCharacters(in: .whitespacesAndNewlines),
            !urlStr.isEmpty,

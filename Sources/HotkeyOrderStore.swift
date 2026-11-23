@@ -12,6 +12,42 @@ struct ResolvedSpaceSlot {
     let displayName: String
     let spaceId: Int
     let isCurrent: Bool
+    /// Extra context shown in the order dialog (the apps recorded on that Space).
+    var detail: String? = nil
+}
+
+extension SpaceBootProfile {
+    /// Every recorded Space as a hotkey slot (display order, then Space order).
+    var spaceSlotKeys: [SpaceSlotKey] {
+        displays.flatMap { display in
+            display.spaces.map { SpaceSlotKey(displayUUID: display.displayUUID, spaceIndex: $0.spaceIndex) }
+        }
+    }
+
+    /// `hotkeyOrder` checked against the recorded Spaces: unknown or duplicate keys dropped, missing Spaces appended.
+    var resolvedHotkeyOrder: [SpaceSlotKey] {
+        let all = spaceSlotKeys
+        var seen: Set<SpaceSlotKey> = []
+        let ordered = (hotkeyOrder ?? []).filter { all.contains($0) && seen.insert($0).inserted }
+        return ordered + all.filter { !seen.contains($0) }
+    }
+
+    /// Rows for the hotkey order dialog in `order`, each labelled with the apps recorded on that Space.
+    func hotkeySlotRows(in order: [SpaceSlotKey]) -> [ResolvedSpaceSlot] {
+        order.compactMap { key in
+            guard let display = displays.first(where: { $0.displayUUID == key.displayUUID }),
+                  let space = display.spaces.first(where: { $0.spaceIndex == key.spaceIndex }) else { return nil }
+            var seen: Set<String> = []
+            let apps = space.windows.sorted { $0.zIndex < $1.zIndex }.map(\.appName).filter { seen.insert($0).inserted }
+            return ResolvedSpaceSlot(
+                key: key,
+                displayName: display.displayName,
+                spaceId: 0,
+                isCurrent: false,
+                detail: apps.joined(separator: ", ")
+            )
+        }
+    }
 }
 
 /// Persists the user's custom ⌥1–⌥9 Space ordering at ~/.config/spaceboot/hotkey-order.json
@@ -71,11 +107,6 @@ final class HotkeyOrderStore {
         save()
     }
 
-    func resetToDefault() {
-        savedOrder = []
-        try? FileManager.default.removeItem(atPath: Self.orderFilePath)
-    }
-
     // MARK: - Persistence
 
     private func load() {
@@ -101,30 +132,36 @@ final class HotkeyOrderStore {
     }
 }
 
-/// Native macOS floating window with drag-and-drop reordering for customizing ⌥1–⌥9 Space order.
-final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+/// Floating window with drag-and-drop reordering of one profile's ⌥1–⌥9 Space order
+/// (opened from the profile's "Edit Hotkey Order…" menu item).
+final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     private static let rowDragType = NSPasteboard.PasteboardType("com.spaceboot.space-slot-row")
 
-    private let inspector: SpaceInspector
-    private let orderStore: HotkeyOrderStore
+    private struct ProfileEdit {
+        let name: String
+        let defaultRows: [ResolvedSpaceSlot]
+        let onDone: ([SpaceSlotKey]) -> Void
+    }
+
     private var slots: [ResolvedSpaceSlot] = []
     private let tableView = NSTableView()
+    private let hintLabel = NSTextField(wrappingLabelWithString: "")
+    /// The profile being edited; its order is handed back when the window is confirmed or closed.
+    private var profileEdit: ProfileEdit?
 
-    init(inspector: SpaceInspector, orderStore: HotkeyOrderStore) {
-        self.inspector = inspector
-        self.orderStore = orderStore
-
+    init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 300),
             styleMask: [.titled, .closable, .utilityWindow],
             backing: .buffered,
             defer: false
         )
-        window.title = "Customize Hotkey Order"
+        window.title = "Hotkey Order"
         window.isReleasedWhenClosed = false
         window.level = .floating
 
         super.init(window: window)
+        window.delegate = self
         buildUI()
     }
 
@@ -133,12 +170,34 @@ final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSour
         fatalError("init(coder:) has not been implemented")
     }
 
-    func showAndRefresh() {
-        reloadSlots()
+    /// Shows a profile's Spaces in `rows` order. `onDone` receives the order when the window is confirmed or closed.
+    func showForProfile(
+        named name: String,
+        rows: [ResolvedSpaceSlot],
+        defaultRows: [ResolvedSpaceSlot],
+        onDone: @escaping ([SpaceSlotKey]) -> Void
+    ) {
+        finishProfileEdit()
+        profileEdit = ProfileEdit(name: name, defaultRows: defaultRows, onDone: onDone)
+        window?.title = "Hotkey Order — \(name)"
+        hintLabel.stringValue = "Drag rows to choose which Space each ⌥1–⌥9 opens for “\(name)”. It is saved into the profile and applied every time the profile boots."
+        slots = rows
+        tableView.reloadData()
+
         window?.center()
         NSApp.activate()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        finishProfileEdit()
+    }
+
+    private func finishProfileEdit() {
+        guard let edit = profileEdit else { return }
+        profileEdit = nil
+        edit.onDone(slots.map(\.key))
     }
 
     // MARK: - UI Setup
@@ -160,10 +219,9 @@ final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSour
             container.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
         ])
 
-        let hint = NSTextField(wrappingLabelWithString: "Drag rows to reorder which Space each ⌥1–⌥9 hotkey switches to. Changes save automatically.")
-        hint.font = NSFont.systemFont(ofSize: 12)
-        hint.textColor = .secondaryLabelColor
-        container.addArrangedSubview(hint)
+        hintLabel.font = NSFont.systemFont(ofSize: 12)
+        hintLabel.textColor = .secondaryLabelColor
+        container.addArrangedSubview(hintLabel)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("slot"))
         column.title = "Spaces"
@@ -190,34 +248,25 @@ final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSour
         footer.spacing = 8
 
         let resetBtn = NSButton(title: "Reset Default", target: self, action: #selector(handleReset))
-        let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(handleRefresh))
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let doneBtn = NSButton(title: "Done", target: self, action: #selector(handleDone))
         doneBtn.keyEquivalent = "\r"
 
         footer.addArrangedSubview(resetBtn)
-        footer.addArrangedSubview(refreshBtn)
         footer.addArrangedSubview(spacer)
         footer.addArrangedSubview(doneBtn)
         container.addArrangedSubview(footer)
     }
 
-    private func reloadSlots() {
-        slots = orderStore.orderedSlots(from: inspector.listDisplays())
+    @objc private func handleReset() {
+        guard let edit = profileEdit else { return }
+        slots = edit.defaultRows
         tableView.reloadData()
     }
 
-    @objc private func handleReset() {
-        orderStore.resetToDefault()
-        reloadSlots()
-    }
-
-    @objc private func handleRefresh() {
-        reloadSlots()
-    }
-
     @objc private func handleDone() {
+        finishProfileEdit()
         window?.close()
     }
 
@@ -276,7 +325,8 @@ final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSour
         }
         if let title = cell.viewWithTag(2) as? NSTextField {
             let activeTag = slot.isCurrent ? "  (Active)" : ""
-            title.stringValue = "\(slot.displayName) · Space \(slot.key.spaceIndex + 1)\(activeTag)"
+            let detail = slot.detail.flatMap { $0.isEmpty ? nil : "  —  \($0)" } ?? ""
+            title.stringValue = "\(slot.displayName) · Space \(slot.key.spaceIndex + 1)\(activeTag)\(detail)"
         }
         return cell
     }
@@ -313,10 +363,7 @@ final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSour
         let insertIndex = destinationRow > sourceRow ? destinationRow - 1 : destinationRow
         let clampedIndex = max(0, min(insertIndex, slots.count))
         slots.insert(moved, at: clampedIndex)
-
-        orderStore.updateOrder(slots.map { $0.key })
         tableView.reloadData()
-        SpaceBootLogger.log("HotkeyOrder updated: " + slots.enumerated().map { "⌥\($0.offset + 1)=\($0.element.displayName)#\($0.element.key.spaceIndex + 1)" }.joined(separator: ", "))
         return true
     }
 }

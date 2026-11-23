@@ -19,19 +19,36 @@ enum SpaceBootConfig {
     static let spaceSwitchTimeoutSeconds: TimeInterval = 2.0
     static let spaceSwitchPollMicros: useconds_t = 80_000
     static let spaceAnimationSettleMicros: useconds_t = 400_000
-    static let launchWindowTimeoutSeconds: TimeInterval = 12.0
-    static let processInitTimeoutSeconds: TimeInterval = 18.0
-    static let splashExtendedTimeoutSeconds: TimeInterval = 30.0
-    static let launchPollMicros: useconds_t = 300_000
+    /// ⌥1–⌥9 switches hold their lock only this long after arrival (boots keep the longer settle).
+    static let interactiveSettleMicros: useconds_t = 80_000
+    static let interactivePollMicros: useconds_t = 40_000
     static let frameVerifyTolerancePx = 24
     static let frameApplyMaxAttempts = 5
     static let frameVerifyDelayMicros: useconds_t = 220_000
-    static let replacementWatchDelayMicros: useconds_t = 900_000
     static let raiseWindowDelayMicros: useconds_t = 70_000
-    static let parallelLaunchStaggerMicros: useconds_t = 400_000
     static let postBootSettleGuardSeconds: TimeInterval = 15.0
-    static let postBootSettlePollMicros: useconds_t = 800_000
-    static let lateArrivalWatchSeconds: TimeInterval = 60.0
+
+    // Event-driven boot pipeline (see BootSession).
+    static let coldLaunchStaggerSeconds: TimeInterval = 1.0
+    static let executorPollMicros: useconds_t = 250_000
+    static let freshWindowSettleSeconds: TimeInterval = 0.3
+    static let windowRequestResponseSeconds: TimeInterval = 3.0
+    static let windowRequestRetrySeconds: TimeInterval = 8.0
+    static let maxWindowRequestsPerSlot = 2
+    static let postReadyGraceSeconds: TimeInterval = 1.5
+    static let foregroundWaitPerAppSeconds: TimeInterval = 15.0
+    static let foregroundPhaseMaxSeconds: TimeInterval = 90.0
+    static let pendingWindowWatchSeconds: TimeInterval = 300.0
+    static let settleAfterForegroundSeconds: TimeInterval = 20.0
+    static let replacementWaitSeconds: TimeInterval = 60.0
+    static let handoverWatchSeconds: TimeInterval = 120.0
+    static let maxRequestSwitchFailures = 3
+    static let missingWindowGraceSeconds: TimeInterval = 5.0
+    static let maxPlacementAttempts = 3
+    static let maxRelocationAttempts = 2
+    static let relocationJoinTimeoutSeconds: TimeInterval = 3.0
+    static let userIdleBeforeSwitchSeconds: TimeInterval = 1.0
+    static let promptNudgeDelaySeconds: TimeInterval = 2.0
 
     /// macOS system/daemon processes excluded from recorded workspace layouts.
     static let ignoredBundleIds: Set<String> = [
@@ -131,6 +148,9 @@ struct SpaceBootProfile: Codable {
     var name: String
     var updatedAt: String
     var displays: [DisplayLayout]
+    /// ⌥1–⌥9 order of this profile's recorded Spaces (display + recorded Space index), chosen right after
+    /// recording and applied whenever the profile boots. Absent in profiles recorded before this existed.
+    var hotkeyOrder: [SpaceSlotKey]? = nil
 
     var totalWindowCount: Int {
         displays.reduce(0) { sum, d in

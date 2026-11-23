@@ -9,13 +9,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var controller = WindowController(inspector: inspector)
     private lazy var profileManager = ProfileManager(inspector: inspector, controller: controller)
     private let orderStore = HotkeyOrderStore()
-    private lazy var orderWindowController = HotkeyOrderWindowController(inspector: inspector, orderStore: orderStore)
+    private lazy var orderWindowController = HotkeyOrderWindowController()
     private let hotKeyManager = HotKeyManager()
     private let interactiveSwitchQueue = DispatchQueue(label: "com.spaceboot.interactive-switch", qos: .userInteractive)
 
     private var statusItem: NSStatusItem!
     private var isBusy = false
     private var isSwitchingSpace = false
+    /// Latest interactive switch asked for while another one was still running (main thread only).
+    private var pendingSwitch: SwitchRequest?
+
+    private enum SwitchRequest {
+        case hotkey(slotIndex: Int)
+        case slot(SpaceSlotKey)
+    }
 
     private var hotKeysEnabled: Bool {
         get {
@@ -63,22 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         switch action {
         case .switchDesktop(let slotIndex):
-            guard !isSwitchingSpace else { return }
-            isSwitchingSpace = true
-            interactiveSwitchQueue.async { [weak self] in
-                defer {
-                    DispatchQueue.main.async { self?.isSwitchingSpace = false }
-                }
-                guard let self = self else { return }
-                if !AXIsProcessTrusted() {
-                    SpaceBootLogger.log("Hotkey ⌥\(slotIndex + 1) ignored: AXIsProcessTrusted is false")
-                    return
-                }
-                let ordered = self.orderStore.orderedSlots(from: self.inspector.listDisplays())
-                guard slotIndex >= 0, slotIndex < ordered.count else { return }
-                let target = ordered[slotIndex]
-                _ = self.controller.switchToSlot(target.key)
-            }
+            requestInteractiveSwitch(.hotkey(slotIndex: slotIndex))
 
         case .bootMatchingProfile:
             let liveDisplays = inspector.listDisplays()
@@ -93,6 +85,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 performApply(named: matching.name, launchMissing: true, silentErrors: false)
             } else {
                 sendNotification(title: "SpaceBoot", body: "No saved profile matches the currently connected displays.")
+            }
+        }
+    }
+
+    /// A ⌥N press (or Spaces menu click) during a running switch is not dropped: the latest one is remembered
+    /// and runs as soon as the current switch finishes, so rapid presses always end on the last one asked for.
+    private func requestInteractiveSwitch(_ request: SwitchRequest) {
+        pendingSwitch = request
+        if !isSwitchingSpace {
+            runPendingSwitch()
+        }
+    }
+
+    private func runPendingSwitch() {
+        guard let request = pendingSwitch else { return }
+        pendingSwitch = nil
+        guard !isBusy else { return }
+
+        let label: String
+        let key: SpaceSlotKey
+        switch request {
+        case .hotkey(let slotIndex):
+            label = "⌥\(slotIndex + 1)"
+            guard AXIsProcessTrusted() else {
+                SpaceBootLogger.log("Hotkey \(label) ignored: AXIsProcessTrusted is false")
+                return
+            }
+            let ordered = orderStore.orderedSlots(from: inspector.listDisplays())
+            guard slotIndex >= 0, slotIndex < ordered.count else { return }
+            key = ordered[slotIndex].key
+        case .slot(let slotKey):
+            label = "menu"
+            key = slotKey
+        }
+
+        isSwitchingSpace = true
+        interactiveSwitchQueue.async { [weak self] in
+            guard let self else { return }
+            let started = Date()
+            let ok = self.controller.switchToSlot(key)
+            SpaceBootLogger.log("Switch \(label) finished in \(Int(Date().timeIntervalSince(started) * 1000))ms ok=\(ok)")
+            DispatchQueue.main.async {
+                self.isSwitchingSpace = false
+                self.runPendingSwitch()
             }
         }
     }
@@ -172,14 +208,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.isEnabled = !isBusy
                 menu.addItem(item)
             }
-
-            let customizeOrderItem = NSMenuItem(
-                title: "  Customize Hotkey Order…",
-                action: #selector(handleCustomizeHotkeyOrder),
-                keyEquivalent: ""
-            )
-            customizeOrderItem.target = self
-            menu.addItem(customizeOrderItem)
         }
 
         menu.addItem(.separator())
@@ -223,6 +251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 recordItem.target = self
                 recordItem.isEnabled = !isBusy
                 sub.addItem(recordItem)
+
+                let hotkeyOrderItem = NSMenuItem(title: "Edit Hotkey Order…", action: #selector(handleEditHotkeyOrder(_:)), keyEquivalent: "")
+                hotkeyOrderItem.representedObject = profile.name
+                hotkeyOrderItem.target = self
+                sub.addItem(hotkeyOrderItem)
 
                 let revealItem = NSMenuItem(title: "Edit Profile JSON…", action: #selector(handleRevealProfile(_:)), keyEquivalent: "")
                 revealItem.representedObject = profile.name
@@ -287,17 +320,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
 
     @objc private func handleSwitchDesktopMenu(_ sender: NSMenuItem) {
-        guard !isBusy, !isSwitchingSpace,
-              let key = sender.representedObject as? SpaceSlotKey else { return }
-        isSwitchingSpace = true
-        interactiveSwitchQueue.async { [weak self] in
-            defer { DispatchQueue.main.async { self?.isSwitchingSpace = false } }
-            _ = self?.controller.switchToSlot(key)
-        }
+        guard !isBusy, let key = sender.representedObject as? SpaceSlotKey else { return }
+        requestInteractiveSwitch(.slot(key))
     }
 
-    @objc private func handleCustomizeHotkeyOrder() {
-        orderWindowController.showAndRefresh()
+    /// Opens the ⌥1–⌥9 order of one profile; Done writes it back into that profile.
+    @objc private func handleEditHotkeyOrder(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String,
+              let profile = profileManager.loadProfile(named: name) else { return }
+        orderWindowController.showForProfile(
+            named: profile.name,
+            rows: profile.hotkeySlotRows(in: profile.resolvedHotkeyOrder),
+            defaultRows: profile.hotkeySlotRows(in: profile.spaceSlotKeys)
+        ) { [weak self] order in
+            self?.saveHotkeyOrder(order, toProfile: profile.name)
+        }
     }
 
     @objc private func handleToggleHotKeys() {
@@ -415,9 +452,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Execution Runners
 
+    /// Records a profile. Its ⌥1–⌥9 order keeps the previous one (or starts from the current order) and can be
+    /// changed later from the profile's "Edit Hotkey Order…".
     private func performRecord(named name: String) {
         do {
-            let profile = try profileManager.recordProfile(named: name)
+            let liveOrder = orderStore.orderedSlots(from: inspector.listDisplays()).map(\.key)
+            let recorded = try profileManager.recordProfile(named: name, liveHotkeyOrder: liveOrder)
+            let profile = recorded.profile
             let detail = profile.displays
                 .map { "\($0.displayName) (\($0.spaceCount)S)" }
                 .joined(separator: " + ")
@@ -425,13 +466,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 title: "SpaceBoot Recorded",
                 body: "\"\(profile.name)\" saved \(profile.totalWindowCount) windows — \(detail)"
             )
+            applyHotkeyOrder(profile.resolvedHotkeyOrder, of: profile, liveSlots: recorded.liveSlots)
         } catch {
             SpaceBootLogger.log("Record error: \(error.localizedDescription)")
             showErrorAlert(title: "Record Failed", message: error.localizedDescription)
         }
     }
 
+    /// Saves a profile's ⌥1–⌥9 order. It takes effect right away only if the profile is the current setup
+    /// (exactly its displays are connected); otherwise the next boot of that profile applies it.
+    private func saveHotkeyOrder(_ order: [SpaceSlotKey], toProfile name: String) {
+        guard var profile = profileManager.loadProfile(named: name) else { return }
+        profile.hotkeyOrder = order
+        do {
+            try profileManager.saveProfile(profile)
+        } catch {
+            SpaceBootLogger.log("Saving hotkey order of '\(name)' failed: \(error.localizedDescription)")
+            showErrorAlert(title: "Saving Hotkey Order Failed", message: error.localizedDescription)
+            return
+        }
+
+        let liveDisplays = inspector.listDisplays()
+        let isCurrentSetup = profile.displays.count == liveDisplays.count &&
+            profile.displays.allSatisfy { inspector.matchLiveDisplay(for: $0, in: liveDisplays) != nil }
+        guard isCurrentSetup else {
+            SpaceBootLogger.log("Hotkey order of '\(name)' saved; it applies the next time that profile boots")
+            return
+        }
+        applyHotkeyOrder(profile.resolvedHotkeyOrder, of: profile, liveSlots: profileManager.bootedLiveSlots(for: profile))
+    }
+
+    /// Points ⌥1–⌥9 at a profile's Spaces in its order (`liveSlots`: where each recorded Space is right now).
+    private func applyHotkeyOrder(_ order: [SpaceSlotKey], of profile: SpaceBootProfile, liveSlots: [SpaceSlotKey: SpaceSlotKey]) {
+        let liveOrder = order.compactMap { liveSlots[$0] }
+        guard !liveOrder.isEmpty else { return }
+        orderStore.updateOrder(liveOrder)
+        let names = Dictionary(profile.displays.map { ($0.displayUUID, $0.displayName) }, uniquingKeysWith: { first, _ in first })
+        SpaceBootLogger.log("HotkeyOrder from profile '\(profile.name)': " + order.enumerated().map {
+            "⌥\($0.offset + 1)=\(names[$0.element.displayUUID] ?? "?")#\($0.element.spaceIndex + 1)"
+        }.joined(separator: ", "))
+    }
+
     private func performApply(named name: String, launchMissing: Bool, silentErrors: Bool) {
+        // Menu items and ⌥⇧B are disabled while busy; this also stops overlapping IPC `boot:` commands.
+        guard !isBusy else {
+            SpaceBootLogger.log("Apply of '\(name)' ignored: a boot is already in progress")
+            return
+        }
         guard let profile = profileManager.loadProfile(named: name) else { return }
         if !AXIsProcessTrusted() {
             SpaceBootLogger.log("Apply aborted: AXIsProcessTrusted is false")
@@ -446,13 +527,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
-                let result = try self.profileManager.applyProfile(profile, launchMissing: launchMissing)
+                let summary = try self.profileManager.applyProfile(profile, launchMissing: launchMissing) { [weak self] final in
+                    let body = final.waitingApps.isEmpty
+                        ? "\"\(profile.name)\": late windows placed too (\(final.placed)/\(final.total) windows)."
+                        : "\"\(profile.name)\": gave up waiting for \(final.waitingApps.joined(separator: ", "))."
+                    DispatchQueue.main.async {
+                        self?.sendNotification(title: "SpaceBoot", body: body)
+                    }
+                }
                 DispatchQueue.main.async {
                     self.setBusy(false)
-                    self.sendNotification(
-                        title: "SpaceBoot Complete",
-                        body: "\"\(profile.name)\" restored \(result.matched)/\(result.total) windows."
+                    self.applyHotkeyOrder(
+                        profile.resolvedHotkeyOrder,
+                        of: profile,
+                        liveSlots: self.profileManager.bootedLiveSlots(for: profile)
                     )
+                    var body = "\"\(profile.name)\" restored \(summary.placed)/\(summary.total) windows."
+                    if !summary.waitingApps.isEmpty {
+                        body += " Waiting for \(summary.waitingApps.joined(separator: ", ")) — they will be placed as soon as they open."
+                    }
+                    self.sendNotification(title: "SpaceBoot Complete", body: body)
                 }
             } catch let actionError as ProfileActionError {
                 SpaceBootLogger.log("Apply error: \(actionError.localizedDescription)")
