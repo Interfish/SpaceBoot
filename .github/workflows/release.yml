@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -16,27 +26,106 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
 
-      - name: Resolve version
-        id: version
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          SEMVER_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
+          if [[ ! "$TAG" =~ $SEMVER_REGEX ]]; then
+            echo "error: tag '$TAG' must match SemVer format vMAJOR.MINOR.PATCH (e.g. v0.1.0)" >&2
+            exit 1
+          fi
 
-      - name: Build & package universal archive
+          VERSION="${TAG#v}"
+          BUILD_NUMBER="$(git rev-list --count HEAD)"
+          PRERELEASE=false
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "build_number=$BUILD_NUMBER"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & package universal release
         run: |
           ./scripts/build.sh \
             --configuration release \
             --arch universal \
             --sign - \
-            --version "${{ steps.version.outputs.value }}" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --build-number "${{ steps.meta.outputs.build_number }}" \
             --package
+
+      - name: Verify release bundle & archives
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          BIN="build/SpaceBoot.app/Contents/MacOS/SpaceBoot"
+          lipo -info "$BIN" | grep -q "arm64"
+          lipo -info "$BIN" | grep -q "x86_64"
+          otool -l "$BIN" | grep -q "minos 14.0"
+          test -f "build/SpaceBoot.app/Contents/Resources/AppIcon.icns"
+          ACTUAL_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "build/SpaceBoot.app/Contents/Info.plist")"
+          test "$ACTUAL_VERSION" = "$VERSION"
+          codesign --verify --deep --strict "build/SpaceBoot.app"
+          hdiutil verify "build/SpaceBoot-${VERSION}-universal.dmg"
+          (cd build && shasum -a 256 -c "SpaceBoot-${VERSION}-universal.dmg.sha256")
+          (cd build && shasum -a 256 -c "SpaceBoot-${VERSION}-universal.zip.sha256")
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ steps.version.outputs.value }}"
-          gh release create "$GITHUB_REF_NAME" \
-            "build/SpaceBoot-${VERSION}-universal.zip" \
-            "build/SpaceBoot-${VERSION}-universal.zip.sha256" \
-            --title "SpaceBoot ${GITHUB_REF_NAME}" \
-            --generate-notes
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          PRERELEASE="${{ steps.meta.outputs.prerelease }}"
+
+          DMG="build/SpaceBoot-${VERSION}-universal.dmg"
+          DMG_SHA="build/SpaceBoot-${VERSION}-universal.dmg.sha256"
+          ZIP="build/SpaceBoot-${VERSION}-universal.zip"
+          ZIP_SHA="build/SpaceBoot-${VERSION}-universal.zip.sha256"
+
+          cat <<'EOF' > build/release-notes.md
+          ### Installation (macOS 14.0+ · Apple Silicon & Intel Universal)
+
+          - **DMG (Recommended)**: Download `SpaceBoot-__VERSION__-universal.dmg`, open it, and drag **SpaceBoot.app** into **Applications**.
+          - **ZIP**: Download `SpaceBoot-__VERSION__-universal.zip`, unzip it, and move **SpaceBoot.app** into `/Applications`.
+
+          > **First Launch (Ad-Hoc Signed Build)**  
+          > Because release builds are ad-hoc signed rather than Apple-notarized, macOS Gatekeeper may block the first launch. Either **right-click → Open** in Finder, or run:
+          > ```bash
+          > xattr -dr com.apple.quarantine /Applications/SpaceBoot.app
+          > open /Applications/SpaceBoot.app
+          > ```
+
+          ### SHA-256 Checksums
+
+          ```text
+          EOF
+          sed -i '' "s/__VERSION__/${VERSION}/g" build/release-notes.md
+          cat "$DMG_SHA" "$ZIP_SHA" >> build/release-notes.md
+          cat <<'EOF' >> build/release-notes.md
+          ```
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" "$DMG_SHA" "$ZIP" "$ZIP_SHA" --clobber
+          else
+            ARGS=(
+              --title "SpaceBoot ${TAG}"
+              --notes-file build/release-notes.md
+              --generate-notes
+              --verify-tag
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              ARGS+=(--prerelease)
+            fi
+            gh release create "$TAG" "$DMG" "$DMG_SHA" "$ZIP" "$ZIP_SHA" "${ARGS[@]}"
+          fi

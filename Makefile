@@ -29,7 +29,7 @@ run: install ## Build, install, and (re)launch SpaceBoot.app
 	@sleep 0.3
 	@open "$(INSTALL_DIR)/$(APP_NAME).app"
 
-package: ## Build universal release .zip archive + .sha256 checksum in ./build/
+package: ## Build universal .dmg and .zip release archives + .sha256 checksums in ./build/
 	@$(BUILD_SCRIPT) --configuration release --arch universal --package $(COMMON_FLAGS)
 
 icon: ## Regenerate Resources/AppIcon.icns and docs/icon.png

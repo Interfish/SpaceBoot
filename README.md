@@ -10,6 +10,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Interfish/SpaceBoot/actions/workflows/ci.yml"><img src="https://github.com/Interfish/SpaceBoot/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Interfish/SpaceBoot/releases/latest"><img src="https://img.shields.io/github/v/release/Interfish/SpaceBoot?style=flat-square&color=0A84FF" alt="Latest Release"></a>
   <img src="https://img.shields.io/badge/macOS-14.0%2B-0A84FF?style=flat-square&logo=apple&logoColor=white" alt="macOS 14.0+">
   <img src="https://img.shields.io/badge/Swift-5.9%2B-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 5.9+">
   <img src="https://img.shields.io/badge/SIP-Enabled-34C759?style=flat-square" alt="SIP Enabled">
@@ -44,8 +46,8 @@ macOS native Spaces work well day to day, but rebooting, switching monitor setup
 
 ### Download a Release
 
-1. Download the latest `SpaceBoot-<version>-universal.zip` from [GitHub Releases](https://github.com/Interfish/SpaceBoot/releases).
-2. Unzip and move `SpaceBoot.app` into `/Applications`.
+1. Download `SpaceBoot-<version>-universal.dmg` (recommended) or `SpaceBoot-<version>-universal.zip` from [GitHub Releases](https://github.com/Interfish/SpaceBoot/releases).
+2. Open the `.dmg` and drag `SpaceBoot.app` into **Applications** (or unzip the `.zip` and move `SpaceBoot.app` into `/Applications`).
 3. Because release builds are ad-hoc signed rather than Apple-notarized, macOS may block the first launch. Either **right-click → Open** in Finder, or run:
 
 ```bash
@@ -169,7 +171,7 @@ make debug       # Build debug SpaceBoot.app into ./build/
 make universal   # Build universal (arm64 + x86_64) SpaceBoot.app into ./build/
 make install     # Build and install into /Applications (override with INSTALL_DIR=...)
 make run         # Build, install, and (re)launch SpaceBoot.app
-make package     # Build universal .zip archive and .sha256 checksum in ./build/
+make package     # Build universal .dmg and .zip archives + .sha256 checksums in ./build/
 make icon        # Regenerate Resources/AppIcon.icns and docs/icon.png
 make clean       # Remove build/ and .build/
 ```
@@ -189,6 +191,15 @@ You can override signing explicitly:
 ```bash
 make build CODESIGN_IDENTITY="-"                                  # Force ad-hoc signing
 make package CODESIGN_IDENTITY="Developer ID Application: ..."    # Sign for distribution (enables Hardened Runtime)
+```
+
+### Releasing
+
+Pushing a SemVer tag (`v*`, e.g. `v0.1.0`) triggers [the Release workflow](.github/workflows/release.yml) on GitHub Actions to build, verify, and publish Universal `.dmg`, `.zip`, and `.sha256` assets to GitHub Releases:
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
 ```
 
 ---

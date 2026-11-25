@@ -33,7 +33,7 @@ Options:
   --version <semver>                    Override CFBundleShortVersionString in built bundle
   --build-number <number>               Override CFBundleVersion in built bundle
   --install                             Copy SpaceBoot.app into $INSTALL_DIR (default: /Applications)
-  --package                             Create a distributable .zip archive and .sha256 checksum
+  --package                             Create distributable .dmg and .zip archives with .sha256 checksums
   -h, --help                            Show this help message
 
 Environment variables:
@@ -220,11 +220,49 @@ if [[ "$DO_PACKAGE" == true ]]; then
   ARCHIVE_NAME="${APP_NAME}-${APP_VERSION}-${ARCHIVE_ARCH}.zip"
   ARCHIVE_PATH="$OUTPUT_DIR/$ARCHIVE_NAME"
   CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
+  DMG_NAME="${APP_NAME}-${APP_VERSION}-${ARCHIVE_ARCH}.dmg"
+  DMG_PATH="$OUTPUT_DIR/$DMG_NAME"
+  DMG_CHECKSUM_PATH="$DMG_PATH.sha256"
 
-  rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH"
+  rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$DMG_PATH" "$DMG_CHECKSUM_PATH"
   ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ARCHIVE_PATH"
   (cd "$OUTPUT_DIR" && shasum -a 256 "$ARCHIVE_NAME" > "$(basename "$CHECKSUM_PATH")")
 
+  DMG_STAGING="$(mktemp -d)"
+  trap 'rm -rf "${DMG_STAGING:-}"' EXIT
+  ditto "$APP_BUNDLE" "$DMG_STAGING/$APP_NAME.app"
+  ln -s /Applications "$DMG_STAGING/Applications"
+
+  DMG_CREATED=false
+  for attempt in 1 2 3; do
+    if hdiutil create \
+      -volname "$APP_NAME $APP_VERSION" \
+      -srcfolder "$DMG_STAGING" \
+      -ov \
+      -format UDZO \
+      -imagekey zlib-level=9 \
+      "$DMG_PATH"; then
+      DMG_CREATED=true
+      break
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      echo "hdiutil create attempt $attempt failed; retrying in 2s..." >&2
+      sleep 2
+    fi
+  done
+
+  rm -rf "$DMG_STAGING"
+  DMG_STAGING=""
+  if [[ "$DMG_CREATED" != true ]]; then
+    echo "error: failed to create $DMG_PATH after 3 attempts" >&2
+    exit 1
+  fi
+
+  hdiutil verify "$DMG_PATH" >/dev/null
+  (cd "$OUTPUT_DIR" && shasum -a 256 "$DMG_NAME" > "$(basename "$DMG_CHECKSUM_PATH")")
+
   echo "==> Packaged: $ARCHIVE_PATH"
   echo "==> Checksum: $CHECKSUM_PATH"
+  echo "==> Packaged: $DMG_PATH"
+  echo "==> Checksum: $DMG_CHECKSUM_PATH"
 fi

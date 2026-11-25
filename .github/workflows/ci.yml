@@ -31,6 +31,8 @@ jobs:
           otool -l "$BIN" | grep -q "minos 14.0"
           test -f "build/SpaceBoot.app/Contents/Resources/AppIcon.icns"
           codesign --verify --deep --strict "build/SpaceBoot.app"
+          hdiutil verify build/SpaceBoot-*-universal.dmg
+          (cd build && shasum -a 256 -c SpaceBoot-*-universal.dmg.sha256)
           (cd build && shasum -a 256 -c SpaceBoot-*-universal.zip.sha256)
 
       - name: Upload build artifact
@@ -38,6 +40,8 @@ jobs:
         with:
           name: SpaceBoot-universal
           path: |
+            build/SpaceBoot-*-universal.dmg
+            build/SpaceBoot-*-universal.dmg.sha256
             build/SpaceBoot-*-universal.zip
             build/SpaceBoot-*-universal.zip.sha256
           retention-days: 14
