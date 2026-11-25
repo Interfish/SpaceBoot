@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build & Verify macOS Universal App
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Verify icon generator
+        run: swift scripts/generate-icon.swift
+
+      - name: Build universal release bundle
+        run: ./scripts/build.sh --configuration release --arch universal --sign - --package
+
+      - name: Verify bundle integrity
+        run: |
+          BIN="build/SpaceBoot.app/Contents/MacOS/SpaceBoot"
+          lipo -info "$BIN" | grep -q "arm64"
+          lipo -info "$BIN" | grep -q "x86_64"
+          otool -l "$BIN" | grep -q "minos 14.0"
+          test -f "build/SpaceBoot.app/Contents/Resources/AppIcon.icns"
+          codesign --verify --deep --strict "build/SpaceBoot.app"
+          (cd build && shasum -a 256 -c SpaceBoot-*-universal.zip.sha256)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpaceBoot-universal
+          path: |
+            build/SpaceBoot-*-universal.zip
+            build/SpaceBoot-*-universal.zip.sha256
+          retention-days: 14

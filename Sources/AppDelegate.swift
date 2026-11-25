@@ -4,6 +4,7 @@ import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let hotKeysPrefKey = "SpaceBootGlobalHotKeysEnabled"
+    private static let busyIconFrameInterval: TimeInterval = 0.35
 
     private let inspector = SpaceInspector()
     private lazy var controller = WindowController(inspector: inspector)
@@ -11,9 +12,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let orderStore = HotkeyOrderStore()
     private lazy var orderWindowController = HotkeyOrderWindowController()
     private let hotKeyManager = HotKeyManager()
+    private let notifications = NotificationService()
     private let interactiveSwitchQueue = DispatchQueue(label: "com.spaceboot.interactive-switch", qos: .userInteractive)
 
     private var statusItem: NSStatusItem!
+    private var busyIconTimer: Timer?
+    private var busyIconPhase = 0
     private var isBusy = false
     private var isSwitchingSpace = false
     /// Latest interactive switch asked for while another one was still running (main thread only).
@@ -45,11 +49,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         SpaceBootLogger.log("SpaceBoot launched. AXIsProcessTrusted=\(AXIsProcessTrusted())")
+        notifications.configure()
         registerDistributedCommands()
         syncHotKeysState()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopBusyIconAnimation()
         hotKeyManager.unregister()
     }
 
@@ -579,14 +585,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateStatusIcon(busy: Bool) {
         guard let button = statusItem.button else { return }
-        let symbolName = busy ? "hourglass" : "bolt.horizontal.circle"
-        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: SpaceBootConfig.appName) {
-            image.isTemplate = true
-            button.image = image
-            button.title = ""
+        button.title = ""
+        if busy {
+            startBusyIconAnimation()
         } else {
-            button.title = busy ? "…" : "SB"
+            stopBusyIconAnimation()
+            button.image = StatusBarIcon.idleImage()
         }
+    }
+
+    private func startBusyIconAnimation() {
+        stopBusyIconAnimation()
+        busyIconPhase = 0
+        statusItem.button?.image = StatusBarIcon.busyImage(phase: busyIconPhase)
+
+        let timer = Timer(timeInterval: Self.busyIconFrameInterval, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.busyIconPhase = (self.busyIconPhase + 1) % StatusBarIcon.busyPhaseCount
+            self.statusItem.button?.image = StatusBarIcon.busyImage(phase: self.busyIconPhase)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        busyIconTimer = timer
+    }
+
+    private func stopBusyIconAnimation() {
+        busyIconTimer?.invalidate()
+        busyIconTimer = nil
     }
 
     private func showAccessibilityAlert() {
@@ -627,9 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func sendNotification(title: String, body: String) {
-        let escapedTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
-        let escapedBody = body.replacingOccurrences(of: "\"", with: "\\\"")
-        runShell("/usr/bin/osascript", ["-e", "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""])
+        notifications.post(title: title, body: body)
     }
 
     private func runShell(_ path: String, _ args: [String]) {

@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Universal Release
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & package universal archive
+        run: |
+          ./scripts/build.sh \
+            --configuration release \
+            --arch universal \
+            --sign - \
+            --version "${{ steps.version.outputs.value }}" \
+            --package
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          gh release create "$GITHUB_REF_NAME" \
+            "build/SpaceBoot-${VERSION}-universal.zip" \
+            "build/SpaceBoot-${VERSION}-universal.zip.sha256" \
+            --title "SpaceBoot ${GITHUB_REF_NAME}" \
+            --generate-notes
