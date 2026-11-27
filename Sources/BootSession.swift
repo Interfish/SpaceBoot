@@ -1,6 +1,42 @@
 import Cocoa
 import Foundation
 
+/// Represents a native Fullscreen (1 window) or Split View (2 windows) Space to assemble or adjust during a boot.
+final class FullScreenGroup {
+    let displayUUID: String
+    let displayName: String
+    let kind: SpaceKind
+    let splitRatio: Double?
+    let stagingSpaceId: Int
+    let isHomeSpace: Bool
+    var memberSlots: [BootSlot] = []
+    var liveFullScreenSpaceId: Int?
+    var completed = false
+    var attempts = 0
+    var notBefore: Date?
+
+    init(
+        displayUUID: String,
+        displayName: String,
+        kind: SpaceKind,
+        splitRatio: Double?,
+        stagingSpaceId: Int,
+        isHomeSpace: Bool
+    ) {
+        self.displayUUID = displayUUID
+        self.displayName = displayName
+        self.kind = kind
+        self.splitRatio = splitRatio
+        self.stagingSpaceId = stagingSpaceId
+        self.isHomeSpace = isHomeSpace
+    }
+
+    var label: String {
+        let names = memberSlots.map(\.record.appName).joined(separator: " | ")
+        return "\(kind.rawValue) [\(names)] → \(displayName)"
+    }
+}
+
 /// A profile window resolved against the live displays when a boot starts.
 /// Targets are bound to Space IDs (not positions), so macOS reordering Spaces mid-boot cannot redirect windows.
 final class BootSlot {
@@ -11,6 +47,8 @@ final class BootSlot {
     let spaceIndex: Int
     let targetSpaceId: Int
     let isHomeSpace: Bool
+    let isFullScreenMember: Bool
+    weak var fullScreenGroup: FullScreenGroup?
 
     var windowId: Int?
     var pid: pid_t = 0
@@ -35,7 +73,17 @@ final class BootSlot {
     var waitDeadline: Date?
     var gaveUp = false
 
-    init(record: WindowRecord, order: Int, displayUUID: String, displayName: String, spaceIndex: Int, targetSpaceId: Int, isHomeSpace: Bool) {
+    init(
+        record: WindowRecord,
+        order: Int,
+        displayUUID: String,
+        displayName: String,
+        spaceIndex: Int,
+        targetSpaceId: Int,
+        isHomeSpace: Bool,
+        isFullScreenMember: Bool = false,
+        fullScreenGroup: FullScreenGroup? = nil
+    ) {
         self.record = record
         self.order = order
         self.displayUUID = displayUUID
@@ -43,6 +91,8 @@ final class BootSlot {
         self.spaceIndex = spaceIndex
         self.targetSpaceId = targetSpaceId
         self.isHomeSpace = isHomeSpace
+        self.isFullScreenMember = isFullScreenMember
+        self.fullScreenGroup = fullScreenGroup
         self.expectedFrame = record.frame
     }
 
@@ -71,13 +121,19 @@ final class BootSession {
         let waitingApps: [String]
     }
 
+    private enum HomeTarget {
+        case desktop(displayUUID: String, spaceId: Int)
+        case fullScreenGroup(displayUUID: String, group: FullScreenGroup)
+    }
+
     private let inspector: SpaceInspector
     private let controller: WindowController
     private let launcher: AppLauncher
     private let profileName: String
     private let launchMissing: Bool
     private let slots: [BootSlot]
-    private let homeSpaces: [(displayUUID: String, spaceId: Int)]
+    private let fullScreenGroups: [FullScreenGroup]
+    private let homeTargets: [HomeTarget]
     private let managedSpaceIds: Set<Int>
     private let startedAt = Date()
     /// Cold apps that are not launched up front because a window of theirs could not be moved to its Space later.
@@ -119,28 +175,79 @@ final class BootSession {
         self.launchMissing = launchMissing
 
         var slots: [BootSlot] = []
-        var homes: [(displayUUID: String, spaceId: Int)] = []
+        var groups: [FullScreenGroup] = []
+        var homes: [HomeTarget] = []
+
         for pair in displayPairs {
-            let liveIds = pair.live.desktopSpaceIds
-            for space in pair.saved.spaces where !space.windows.isEmpty && space.spaceIndex < liveIds.count {
-                for record in space.windows {
-                    slots.append(BootSlot(
-                        record: record,
-                        order: slots.count,
+            let desktopIds = pair.live.desktopSpaceIds
+            var desktopRank = 0
+            var displayHome: HomeTarget?
+
+            for space in pair.saved.spaces.sorted(by: { $0.spaceIndex < $1.spaceIndex }) where !space.windows.isEmpty {
+                let isHome = space.spaceIndex == pair.saved.activeSpaceIndex
+                switch space.effectiveKind {
+                case .desktop:
+                    guard desktopRank < desktopIds.count else { continue }
+                    let targetSpaceId = desktopIds[desktopRank]
+                    desktopRank += 1
+                    for record in space.windows {
+                        slots.append(BootSlot(
+                            record: record,
+                            order: slots.count,
+                            displayUUID: pair.live.uuid,
+                            displayName: pair.saved.displayName,
+                            spaceIndex: space.spaceIndex,
+                            targetSpaceId: targetSpaceId,
+                            isHomeSpace: isHome
+                        ))
+                    }
+                    if isHome {
+                        displayHome = .desktop(displayUUID: pair.live.uuid, spaceId: targetSpaceId)
+                    }
+
+                case .fullscreen, .split:
+                    guard let stagingId = desktopIds.last else { continue }
+                    let groupKind: SpaceKind = (space.effectiveKind == .split && space.windows.count >= 2) ? .split : .fullscreen
+                    let group = FullScreenGroup(
                         displayUUID: pair.live.uuid,
                         displayName: pair.saved.displayName,
-                        spaceIndex: space.spaceIndex,
-                        targetSpaceId: liveIds[space.spaceIndex],
-                        isHomeSpace: space.spaceIndex == pair.saved.activeSpaceIndex
-                    ))
+                        kind: groupKind,
+                        splitRatio: groupKind == .split ? space.splitRatio : nil,
+                        stagingSpaceId: stagingId,
+                        isHomeSpace: isHome
+                    )
+                    let targetRecords = groupKind == .split ? Array(space.windows.prefix(2)) : Array(space.windows.prefix(1))
+                    for record in targetRecords {
+                        let slot = BootSlot(
+                            record: record,
+                            order: slots.count,
+                            displayUUID: pair.live.uuid,
+                            displayName: pair.saved.displayName,
+                            spaceIndex: space.spaceIndex,
+                            targetSpaceId: stagingId,
+                            isHomeSpace: isHome,
+                            isFullScreenMember: true,
+                            fullScreenGroup: group
+                        )
+                        group.memberSlots.append(slot)
+                        slots.append(slot)
+                    }
+                    groups.append(group)
+                    if isHome {
+                        displayHome = .fullScreenGroup(displayUUID: pair.live.uuid, group: group)
+                    }
                 }
             }
-            if pair.saved.requiredSpaceCount > 0, !liveIds.isEmpty {
-                homes.append((pair.live.uuid, liveIds[min(pair.saved.activeSpaceIndex, liveIds.count - 1)]))
+
+            if let displayHome {
+                homes.append(displayHome)
+            } else if !desktopIds.isEmpty {
+                homes.append(.desktop(displayUUID: pair.live.uuid, spaceId: desktopIds[0]))
             }
         }
         self.slots = slots
-        self.homeSpaces = homes
+        self.fullScreenGroups = groups
+        self.homeTargets = homes
         self.managedSpaceIds = Set(slots.map(\.targetSpaceId))
     }
 
@@ -181,8 +288,17 @@ final class BootSession {
         }
 
         skipUnreachableSlots()
-        for home in homeSpaces {
-            controller.ensureSpaceVisible(displayUUID: home.displayUUID, spaceId: home.spaceId)
+        for home in homeTargets {
+            switch home {
+            case .desktop(let displayUUID, let spaceId):
+                controller.ensureSpaceVisible(displayUUID: displayUUID, spaceId: spaceId)
+            case .fullScreenGroup(let displayUUID, let group):
+                if let fsId = group.liveFullScreenSpaceId {
+                    controller.ensureSpaceVisible(displayUUID: displayUUID, spaceId: fsId)
+                } else {
+                    controller.ensureSpaceVisible(displayUUID: displayUUID, spaceId: group.stagingSpaceId)
+                }
+            }
         }
         nudgeBlockedApps(
             windows: inspector.listAllUserWindows(),
@@ -265,6 +381,9 @@ final class BootSession {
             runSequence { requestWindow(slot) }
             return true
         }
+        if applyReadyFullScreenGroups(byId: byId, now: now) {
+            return true
+        }
         return false
     }
 
@@ -326,10 +445,13 @@ final class BootSession {
     /// (a straight cross-display move), or its display has a helper display to bounce through.
     private func canReach(_ slot: BootSlot, from win: LiveWindowInfo, displays: [LiveDisplayInfo]) -> Bool {
         if win.spaceIds.contains(slot.targetSpaceId) { return true }
-        guard let source = displays.first(where: { d in win.spaceIds.contains(where: d.desktopSpaceIds.contains) }) else {
-            return false
+        if let source = displays.first(where: { d in win.spaceIds.contains(where: d.desktopSpaceIds.contains) }) {
+            return source.uuid != slot.displayUUID || hasHelper(for: source.uuid, displays: displays)
         }
-        return source.uuid != slot.displayUUID || hasHelper(for: source.uuid, displays: displays)
+        if slot.isFullScreenMember, inspector.fullScreenSpace(hostingWindow: win.windowId, in: displays) != nil {
+            return true
+        }
+        return false
     }
 
     private func canRequestWindow(_ slot: BootSlot, now: Date) -> Bool {
@@ -377,17 +499,22 @@ final class BootSession {
             if let at = launched[slot.appId], now.timeIntervalSince(at) < SpaceBootConfig.foregroundWaitPerAppSeconds { return true }
             if let arrived = lastArrivalAt[slot.appId], now.timeIntervalSince(arrived) < SpaceBootConfig.postReadyGraceSeconds + 1 { return true }
         }
+        if fullScreenGroups.contains(where: { !$0.completed && $0.attempts < 2 && $0.memberSlots.allSatisfy { $0.windowId != nil } }) {
+            return true
+        }
         return false
     }
 
     private func hasBackgroundWork() -> Bool {
         let now = Date()
-        return slots.contains { $0.isOpen || $0.awaitsPlacement || watchesHandover($0, now: now) }
+        return slots.contains { $0.isOpen || $0.awaitsPlacement || watchesHandover($0, now: now) } ||
+            fullScreenGroups.contains { !$0.completed && $0.attempts < 2 && $0.memberSlots.allSatisfy { $0.windowId != nil } }
     }
 
     /// A launched app may swap its first window for the real one (loader → main, login → main) well after it was
     /// placed — e.g. a long SSO login — so its windows are watched for a handover for a while after launch.
     private func watchesHandover(_ slot: BootSlot, now: Date) -> Bool {
+        if slot.fullScreenGroup?.completed == true { return false }
         guard let wid = slot.windowId, slot.placedAt != nil, !preexistingIds.contains(wid) else { return false }
         if isGuarded(slot, now: now) { return true }
         stateLock.lock()
@@ -401,6 +528,7 @@ final class BootSession {
     /// catch apps that move themselves or swap their startup window for the real one. Windows that were already
     /// open before the boot are left to the user once placed.
     private func isGuarded(_ slot: BootSlot, now: Date) -> Bool {
+        guard !slot.isFullScreenMember else { return false }
         guard let wid = slot.windowId, let placedAt = slot.placedAt, !preexistingIds.contains(wid) else { return false }
         guard let ended = foregroundEndedAt else { return true }
         let until = max(
@@ -584,28 +712,75 @@ final class BootSession {
 
     // MARK: - Binding Windows to Slots
 
-    /// Claims windows that are already open: first those on their target Space, then (when windows can be moved
-    /// between Spaces) surplus windows sitting on another Space of this profile, instead of launching duplicates.
+    /// Claims windows that are already open:
+    /// 1. Live Fullscreen/Split Spaces that already match recorded FullscreenGroups;
+    /// 2. Desktop windows already on their target Space;
+    /// 3. Surplus open windows sitting on other reachable Spaces.
     private func bindExistingWindows() {
+        let displays = inspector.listDisplays()
         let windows = inspector.listAllUserWindows()
-        let visibleIds = Set(inspector.listDisplays().map(\.currentSpaceId))
+        let windowsById = Dictionary(windows.map { ($0.windowId, $0) }, uniquingKeysWith: { first, _ in first })
+        let visibleIds = Set(displays.map(\.currentSpaceId))
         preexistingIds = Set(windows.map(\.windowId))
         baselineIds = preexistingIds
         runningAtStart = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
 
-        for (spaceId, group) in Dictionary(grouping: slots, by: \.targetSpaceId) {
-            let onSpace = windows.filter { $0.spaceIds.contains(spaceId) && !claimedIds.contains($0.windowId) }
+        var fullScreenWindowIds: Set<Int> = []
+        for display in displays {
+            for space in display.spaces where space.kind != .desktop {
+                for tile in space.tiles {
+                    fullScreenWindowIds.insert(tile.windowId)
+                }
+            }
+        }
+
+        // Pass 0: Match already-live Fullscreen / Split View Spaces to FullScreenGroups.
+        var matchedLiveFsSpaceIds: Set<Int> = []
+        for requireTitleHint in [true, false] {
+            for group in fullScreenGroups where group.liveFullScreenSpaceId == nil {
+                guard let liveDisplay = displays.first(where: { $0.uuid == group.displayUUID }) else { continue }
+                for space in liveDisplay.spaces where !matchedLiveFsSpaceIds.contains(space.id) && space.kind == group.kind {
+                    guard let pairedWins = matchFullScreenSpace(space, to: group, windowsById: windowsById, requireTitleHint: requireTitleHint) else {
+                        continue
+                    }
+                    matchedLiveFsSpaceIds.insert(space.id)
+                    for (slot, win) in zip(group.memberSlots, pairedWins) {
+                        bind(slot, to: win, verified: true)
+                        slot.placedAt = Date()
+                    }
+                    group.liveFullScreenSpaceId = space.id
+                    if group.kind == .fullscreen {
+                        group.completed = true
+                    } else if let targetRatio = group.splitRatio, let liveRatio = space.splitRatio {
+                        group.completed = abs(liveRatio - targetRatio) <= SpaceBootConfig.splitRatioTolerance
+                    } else {
+                        group.completed = true
+                    }
+                    SpaceBootLogger.log("Matched live \(group.kind.rawValue) sp=\(space.id) for \(group.label) (completed=\(group.completed))")
+                    break
+                }
+            }
+        }
+
+        // Pass 1: Desktop slots on their target Desktop Space (do not steal windows already in Fullscreen/Split).
+        let desktopSlots = slots.filter { !$0.isFullScreenMember && $0.isOpen }
+        for (spaceId, group) in Dictionary(grouping: desktopSlots, by: \.targetSpaceId) {
+            let onSpace = windows.filter {
+                $0.spaceIds.contains(spaceId) && !claimedIds.contains($0.windowId) && !fullScreenWindowIds.contains($0.windowId)
+            }
             for (slot, win) in matchSlots(group.sorted { $0.order < $1.order }, to: onSpace) {
                 bind(slot, to: win, verified: win.spaceIds.contains(where: visibleIds.contains))
             }
         }
 
-        let displays = inspector.listDisplays()
+        // Pass 2: Reuse unclaimed open windows across managed Spaces (or FullscreenGroup member slots).
         for slot in slots where slot.isOpen {
             guard let stray = windows.first(where: { win in
-                !claimedIds.contains(win.windowId) && win.appId == slot.appId &&
-                    win.spaceIds.contains(where: managedSpaceIds.contains) &&
-                    canReach(slot, from: win, displays: displays) &&
+                guard !claimedIds.contains(win.windowId) && win.appId == slot.appId else { return false }
+                let allowedOnDesktop = win.spaceIds.contains(where: managedSpaceIds.contains)
+                let allowedInFs = slot.isFullScreenMember && fullScreenWindowIds.contains(win.windowId)
+                guard allowedOnDesktop || allowedInFs else { return false }
+                return canReach(slot, from: win, displays: displays) &&
                     controller.isLikelyMainWindow(win, expectedFrame: slot.record.frame)
             }) else { continue }
             SpaceBootLogger.log("Reusing open wid=\(stray.windowId) (\(stray.appName)) from sp=\(stray.spaceIds) for \(slot.label)")
@@ -613,6 +788,31 @@ final class BootSession {
         }
 
         SpaceBootLogger.log("Matched \(slots.filter { $0.windowId != nil }.count)/\(slots.count) already-open window(s)")
+    }
+
+    private func matchFullScreenSpace(
+        _ space: LiveSpaceInfo,
+        to group: FullScreenGroup,
+        windowsById: [Int: LiveWindowInfo],
+        requireTitleHint: Bool
+    ) -> [LiveWindowInfo]? {
+        guard space.tiles.count >= group.memberSlots.count else { return nil }
+        let tileWins = space.tiles.prefix(group.memberSlots.count).compactMap { windowsById[$0.windowId] }
+        guard tileWins.count == group.memberSlots.count else { return nil }
+
+        let hasAnyHint = group.memberSlots.contains { !($0.record.titleHint ?? "").isEmpty }
+        if requireTitleHint && !hasAnyHint { return nil }
+
+        for (slot, win) in zip(group.memberSlots, tileWins) {
+            guard win.appId == slot.appId else { return nil }
+            if requireTitleHint, let hint = slot.record.titleHint, !hint.isEmpty {
+                let title = controller.inspectAXWindow(windowId: win.windowId, pid: win.pid)?.title ?? win.title
+                if !title.localizedCaseInsensitiveContains(hint) {
+                    return nil
+                }
+            }
+        }
+        return tileWins
     }
 
     private func matchSlots(_ group: [BootSlot], to live: [LiveWindowInfo]) -> [(BootSlot, LiveWindowInfo)] {
@@ -737,6 +937,52 @@ final class BootSession {
 
         let targetWasVisible = visible[slot.displayUUID] == slot.targetSpaceId
         let moved = !win.spaceIds.contains(slot.targetSpaceId)
+
+        if slot.isFullScreenMember {
+            if let group = slot.fullScreenGroup {
+                if group.liveFullScreenSpaceId != nil {
+                    slot.placedAt = Date()
+                    return
+                }
+                if group.kind == .fullscreen,
+                   let existingFs = inspector.fullScreenSpace(hostingWindow: wid),
+                   existingFs.display.uuid == slot.displayUUID,
+                   existingFs.space.kind == .fullscreen,
+                   !fullScreenGroups.contains(where: { $0 !== group && $0.liveFullScreenSpaceId == existingFs.space.id }) {
+                    group.liveFullScreenSpaceId = existingFs.space.id
+                    group.completed = true
+                    slot.placedAt = Date()
+                    SpaceBootLogger.log("Adopted self-restored fullscreen wid=\(wid) on sp=\(existingFs.space.id) for \(slot.label)")
+                    return
+                }
+            }
+            if inspector.fullScreenSpace(hostingWindow: wid) != nil {
+                _ = controller.exitFullScreen(windowId: wid, pid: win.pid)
+            }
+            let stagingFrame = stagingDesktopFrame(for: slot)
+            let onTarget = inspector.spaceIds(forWindow: wid).contains(slot.targetSpaceId) || controller.relocateWindow(
+                windowId: wid,
+                pid: win.pid,
+                frame: stagingFrame,
+                targetDisplayUUID: slot.displayUUID,
+                targetSpaceId: slot.targetSpaceId
+            )
+            if !onTarget {
+                slot.placementFailures += 1
+                if slot.placementFailures < SpaceBootConfig.maxPlacementAttempts {
+                    slot.notBefore = Date().addingTimeInterval(2.0 * Double(slot.placementFailures))
+                    return
+                }
+            }
+            slot.placedAt = Date()
+            SpaceBootLogger.log("Staged fullscreen member wid=\(wid) \(slot.label) on sp=\(slot.targetSpaceId) onTarget=\(onTarget)")
+            return
+        }
+
+        if inspector.fullScreenSpace(hostingWindow: wid) != nil {
+            _ = controller.exitFullScreen(windowId: wid, pid: win.pid)
+        }
+
         let onTarget = controller.relocateWindow(
             windowId: wid,
             pid: win.pid,
@@ -793,12 +1039,106 @@ final class BootSession {
         return true
     }
 
+    /// Transitions staged Fullscreen/Split member windows into native macOS Fullscreen / Split View
+    /// and adjusts vertical split divider ratios once all Desktop placements on that display have settled.
+    private func applyReadyFullScreenGroups(byId: [Int: LiveWindowInfo], now: Date) -> Bool {
+        for group in fullScreenGroups where !group.completed && group.attempts < 2 {
+            if let notBefore = group.notBefore, now < notBefore { continue }
+
+            // Case 1: Split View already paired on boot; only the vertical divider ratio needs adjustment.
+            if let liveFsId = group.liveFullScreenSpaceId, group.kind == .split, let targetRatio = group.splitRatio {
+                group.attempts += 1
+                runSequence {
+                    let ok = controller.adjustSplitDivider(spaceId: liveFsId, onDisplay: group.displayUUID, targetRatio: targetRatio)
+                    if ok || group.attempts >= 2 {
+                        group.completed = true
+                    } else {
+                        group.notBefore = Date().addingTimeInterval(2.0)
+                    }
+                }
+                return true
+            }
+
+            // Wait for regular Desktop placements on this display before switching into Fullscreen.
+            let desktopPlacementsPending = slots.contains {
+                !$0.isFullScreenMember && $0.displayUUID == group.displayUUID && $0.awaitsPlacement
+            }
+            if desktopPlacementsPending { continue }
+
+            // Case 2: All member windows are bound, verified, and staged on `group.stagingSpaceId`.
+            let allStaged = !group.memberSlots.isEmpty && group.memberSlots.allSatisfy { slot in
+                guard slot.placedAt != nil, let wid = slot.windowId, let win = byId[wid] else { return false }
+                return win.spaceIds.contains(group.stagingSpaceId)
+            }
+            guard allStaged else { continue }
+
+            group.attempts += 1
+            if group.kind == .fullscreen, let member = group.memberSlots.first, let wid = member.windowId {
+                runSequence {
+                    if let newSpaceId = controller.enterFullScreen(windowId: wid, pid: member.pid, onDisplay: group.displayUUID) {
+                        group.liveFullScreenSpaceId = newSpaceId
+                        group.completed = true
+                    } else if group.attempts < 2 {
+                        group.notBefore = Date().addingTimeInterval(2.0)
+                    } else {
+                        group.completed = true
+                    }
+                }
+                return true
+            }
+
+            if group.kind == .split, group.memberSlots.count >= 2,
+               let leftWid = group.memberSlots[0].windowId,
+               let rightWid = group.memberSlots[1].windowId {
+                let leftPid = group.memberSlots[0].pid
+                let rightPid = group.memberSlots[1].pid
+                runSequence {
+                    if let newSpaceId = controller.enterSplitView(
+                        leftWindowId: leftWid,
+                        leftPid: leftPid,
+                        rightWindowId: rightWid,
+                        rightPid: rightPid,
+                        onDisplay: group.displayUUID,
+                        splitRatio: group.splitRatio
+                    ) {
+                        group.liveFullScreenSpaceId = newSpaceId
+                        group.completed = true
+                    } else if group.attempts < 2 {
+                        group.notBefore = Date().addingTimeInterval(2.0)
+                    } else {
+                        group.completed = true
+                    }
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    private func stagingDesktopFrame(for slot: BootSlot) -> WindowRect {
+        guard let display = inspector.listDisplays().first(where: { $0.uuid == slot.displayUUID }) else {
+            return slot.record.frame
+        }
+        return WindowRect(
+            x: Int(display.cgFrame.minX + 60),
+            y: Int(display.cgFrame.minY + 60),
+            width: min(max(600, slot.record.frame.width), Int(max(600, display.cgFrame.width - 120))),
+            height: min(max(450, slot.record.frame.height), Int(max(450, display.cgFrame.height - 120)))
+        )
+    }
+
     /// A window already on its target Space at the recorded frame needs nothing (common when an app restores
     /// its own saved frame on launch) — and in particular no Space switch.
     private func markAlreadyInPlace(byId: [Int: LiveWindowInfo]) {
         for slot in slots where slot.awaitsPlacement {
-            guard let win = byId[slot.windowId!], win.spaceIds.contains(slot.targetSpaceId),
-                  win.frame.isApproximatelyEqual(to: slot.record.frame, tolerance: SpaceBootConfig.frameVerifyTolerancePx) else {
+            guard let win = byId[slot.windowId!], win.spaceIds.contains(slot.targetSpaceId) else { continue }
+            if slot.isFullScreenMember {
+                guard slot.verified else { continue }
+                slot.placedAt = Date()
+                SpaceBootLogger.log("Staged in place: wid=\(win.windowId) \(slot.label)")
+                continue
+            }
+            guard win.frame.isApproximatelyEqual(to: slot.record.frame, tolerance: SpaceBootConfig.frameVerifyTolerancePx) else {
                 continue
             }
             slot.placedAt = Date()

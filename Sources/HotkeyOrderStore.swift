@@ -12,6 +12,8 @@ struct ResolvedSpaceSlot {
     let displayName: String
     let spaceId: Int
     let isCurrent: Bool
+    var kind: SpaceKind = .desktop
+    var label: String
     /// Extra context shown in the order dialog (the apps recorded on that Space).
     var detail: String? = nil
 }
@@ -32,19 +34,46 @@ extension SpaceBootProfile {
         return ordered + all.filter { !seen.contains($0) }
     }
 
-    /// Rows for the hotkey order dialog in `order`, each labelled with the apps recorded on that Space.
+    /// Rows for the hotkey order dialog in `order`, each labelled with its Space kind and recorded apps.
     func hotkeySlotRows(in order: [SpaceSlotKey]) -> [ResolvedSpaceSlot] {
-        order.compactMap { key in
+        var desktopLabels: [SpaceSlotKey: String] = [:]
+        for display in displays {
+            var desktopNumber = 0
+            for space in display.spaces where space.effectiveKind == .desktop {
+                desktopNumber += 1
+                desktopLabels[SpaceSlotKey(displayUUID: display.displayUUID, spaceIndex: space.spaceIndex)] = "Desktop \(desktopNumber)"
+            }
+        }
+
+        return order.compactMap { key in
             guard let display = displays.first(where: { $0.displayUUID == key.displayUUID }),
                   let space = display.spaces.first(where: { $0.spaceIndex == key.spaceIndex }) else { return nil }
             var seen: Set<String> = []
             let apps = space.windows.sorted { $0.zIndex < $1.zIndex }.map(\.appName).filter { seen.insert($0).inserted }
+
+            let label: String
+            switch space.effectiveKind {
+            case .desktop:
+                label = desktopLabels[key] ?? "Desktop \(key.spaceIndex + 1)"
+            case .fullscreen:
+                label = "Fullscreen"
+            case .split:
+                if let ratio = space.splitRatio {
+                    let leftPct = Int((ratio * 100).rounded())
+                    label = "Split (\(leftPct)/\(100 - leftPct))"
+                } else {
+                    label = "Split"
+                }
+            }
+
             return ResolvedSpaceSlot(
                 key: key,
                 displayName: display.displayName,
                 spaceId: 0,
                 isCurrent: false,
-                detail: apps.joined(separator: ", ")
+                kind: space.effectiveKind,
+                label: label,
+                detail: apps.joined(separator: space.effectiveKind == .split ? " | " : ", ")
             )
         }
     }
@@ -61,20 +90,41 @@ final class HotkeyOrderStore {
         load()
     }
 
-    /// Returns all currently live Spaces sorted by the user's custom hotkey order.
+    /// Returns all currently live Spaces (Desktop, Fullscreen, Split View) sorted by the user's custom hotkey order.
     func orderedSlots(from displays: [LiveDisplayInfo]) -> [ResolvedSpaceSlot] {
         var liveByKey: [SpaceSlotKey: ResolvedSpaceSlot] = [:]
         var defaultSequence: [SpaceSlotKey] = []
 
         for display in displays {
-            for (localIdx, spaceId) in display.desktopSpaceIds.enumerated() {
+            var desktopNumber = 0
+            for (localIdx, space) in display.spaces.enumerated() {
                 let key = SpaceSlotKey(displayUUID: display.uuid, spaceIndex: localIdx)
                 defaultSequence.append(key)
+
+                let label: String
+                switch space.kind {
+                case .desktop:
+                    desktopNumber += 1
+                    label = "Desktop \(desktopNumber)"
+                case .fullscreen:
+                    let appName = space.tiles.first.flatMap {
+                        NSRunningApplication(processIdentifier: $0.pid)?.localizedName
+                    }
+                    label = appName.map { "Fullscreen (\($0))" } ?? "Fullscreen"
+                case .split:
+                    let names = space.tiles.compactMap {
+                        NSRunningApplication(processIdentifier: $0.pid)?.localizedName
+                    }
+                    label = names.isEmpty ? "Split" : "Split (\(names.joined(separator: " | ")))"
+                }
+
                 liveByKey[key] = ResolvedSpaceSlot(
                     key: key,
                     displayName: display.name,
-                    spaceId: spaceId,
-                    isCurrent: spaceId == display.currentSpaceId
+                    spaceId: space.id,
+                    isCurrent: space.id == display.currentSpaceId,
+                    kind: space.kind,
+                    label: label
                 )
             }
         }
@@ -326,7 +376,7 @@ final class HotkeyOrderWindowController: NSWindowController, NSTableViewDataSour
         if let title = cell.viewWithTag(2) as? NSTextField {
             let activeTag = slot.isCurrent ? "  (Active)" : ""
             let detail = slot.detail.flatMap { $0.isEmpty ? nil : "  —  \($0)" } ?? ""
-            title.stringValue = "\(slot.displayName) · Space \(slot.key.spaceIndex + 1)\(activeTag)\(detail)"
+            title.stringValue = "\(slot.displayName) · \(slot.label)\(activeTag)\(detail)"
         }
         return cell
     }

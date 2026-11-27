@@ -202,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let marker = slot.isCurrent ? "●" : "○"
                 let keyHint = (hotKeysEnabled && idx < 9) ? "\(idx + 1)" : ""
                 let item = NSMenuItem(
-                    title: "  \(marker) \(slot.displayName) · Space \(slot.key.spaceIndex + 1)",
+                    title: "  \(marker) \(slot.displayName) · \(slot.label)",
                     action: #selector(handleSwitchDesktopMenu(_:)),
                     keyEquivalent: keyHint
                 )
@@ -471,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let recorded = try profileManager.recordProfile(named: name, liveHotkeyOrder: liveOrder)
             let profile = recorded.profile
             let detail = profile.displays
-                .map { "\($0.displayName) (\($0.spaceCount)S)" }
+                .map { "\($0.displayName) (\($0.requiredSpaceCount)S)" }
                 .joined(separator: " + ")
             sendNotification(
                 title: "SpaceBoot Recorded",

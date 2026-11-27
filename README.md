@@ -26,8 +26,8 @@ macOS native Spaces work well day to day, but rebooting, switching monitor setup
 
 **SpaceBoot** is a pure-Swift menu bar app that works directly with **native macOS Spaces**:
 
-- **Zero-Switch Layout Recording** — Snapshots all connected displays, their non-empty Desktop Spaces, and every open window's frame and z-order without switching away from your current Space.
-- **Event-Driven Workspace Boot** — Cold-launches missing apps in parallel up front, relocates windows onto their target Spaces across displays, and returns control quickly while continuing to watch slow or login-gated apps in the background.
+- **Zero-Switch Layout Recording** — Snapshots all connected displays, their non-empty Desktop, native Fullscreen, and Split View Spaces (including vertical split divider ratios), and every open window's frame and z-order without switching away from your current Space.
+- **Event-Driven Workspace Boot** — Cold-launches missing apps in parallel up front, relocates windows onto their target Spaces across displays, restores native Fullscreen and Split View pairings with their split ratios, and returns control quickly while continuing to watch slow or login-gated apps in the background.
 - **Post-Boot Settle Guard** — Detects apps (such as Electron/Chromium windows) that recenter or swap startup/splash windows after launch, keeping them anchored to their recorded frames and Spaces.
 - **Generic, Zero-Hardcoding Launching** — Uses standard LaunchServices for cold launches, inspects `AXMenuBar` to trigger localized *New Window* menu items for warm multi-window launches, and supports custom login-shell commands in profile JSON.
 - **Customizable Runtime Global Hotkeys** — Fast `⌥1`–`⌥9` Space switching across displays (with coalesced burst stepping) and `⌥⇧B` to boot the profile matching your currently connected displays. Per-profile hotkey ordering is editable via drag-and-drop and leaves zero permanent entries in System Settings.
@@ -94,7 +94,7 @@ make run
 | Action | Description |
 | --- | --- |
 | **Spaces (Hotkey Order)** | Lists live Desktop Spaces in your active `⌥1`–`⌥9` order; click any Space to jump directly. |
-| **New Profile & Record…** | Captures all connected displays, non-empty Spaces, and open windows into a named JSON profile. |
+| **New Profile & Record…** | Captures all connected displays, non-empty Spaces (Desktop, Fullscreen, Split View), and open windows into a named JSON profile. |
 | **Boot Profile (Launch & Arrange)** | Launches missing apps/windows and places every window on its recorded Space and frame. |
 | **Restore Open Windows Only** | Repositions currently open windows without launching closed apps. |
 | **Record Current Layout (Overwrite)** | Updates an existing profile while preserving custom `launch` overrides and hotkey order. |

@@ -78,20 +78,32 @@ final class WindowController {
         let isMinimized = (AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minRef) == .success)
             && ((minRef as? Bool) == true)
 
+        var fsRef: CFTypeRef?
+        let isFullScreen = (AXUIElementCopyAttributeValue(axWindow, "AXFullScreen" as CFString, &fsRef) == .success)
+            && ((fsRef as? Bool) == true)
+
         return AXWindowMeta(
             role: role,
             subrole: subrole,
             title: title,
             isSizeSettable: sizeSettable.boolValue,
             isPositionSettable: posSettable.boolValue,
-            isMinimized: isMinimized
+            isMinimized: isMinimized,
+            isFullScreen: isFullScreen
         )
     }
 
     /// Recording filter: accepts any normal standard window (including fixed-size utilities like Calculator),
-    /// rejecting only non-standard dialogs/tooltips/minimized windows.
-    func isRecordableWindow(_ win: LiveWindowInfo) -> Bool {
+    /// rejecting only non-standard dialogs/tooltips/minimized windows. Fullscreen Spaces allow `isPositionSettable == false`.
+    func isRecordableWindow(_ win: LiveWindowInfo, isFullScreenSpace: Bool = false) -> Bool {
         if let meta = inspectAXWindow(windowId: win.windowId, pid: win.pid) {
+            if isFullScreenSpace {
+                if meta.isMinimized {
+                    logFilterOnce(win.windowId, "Record skip minimized fullscreen wid=\(win.windowId) app=\(win.appName)")
+                    return false
+                }
+                return true
+            }
             if !meta.isStandardMainWindow || !meta.isPositionSettable {
                 logFilterOnce(win.windowId, "Record skip non-standard wid=\(win.windowId) app=\(win.appName) role=\(meta.role) subrole=\(meta.subrole)")
                 return false
@@ -114,12 +126,12 @@ final class WindowController {
                 logFilterOnce(win.windowId, "Filter non-standard window wid=\(win.windowId) app=\(win.appName) role=\(meta.role) subrole=\(meta.subrole) min=\(meta.isMinimized)")
                 return false
             }
-            if !meta.isPositionSettable {
+            if !meta.isPositionSettable && !meta.isFullScreen {
                 logFilterOnce(win.windowId, "Filter immovable window wid=\(win.windowId) app=\(win.appName)")
                 return false
             }
             if expectsLargeWindow {
-                if !meta.isSizeSettable {
+                if !meta.isSizeSettable && !meta.isFullScreen {
                     logFilterOnce(win.windowId, "Filter non-resizable splash wid=\(win.windowId) app=\(win.appName) size=\(win.frame.width)x\(win.frame.height)")
                     return false
                 }
@@ -145,8 +157,8 @@ final class WindowController {
 
     // MARK: - Space Switching (Adaptive to User's macOS Shortcuts)
 
-    /// Navigates the specified display to `targetIndex` (0-based desktop Space),
-    /// using direct "Switch to Desktop N" shortcut if enabled, otherwise stepping with the user's Move Left/Right shortcut.
+    /// Navigates the specified display to `targetIndex` (0-based across all Spaces: Desktop, Fullscreen, Split View),
+    /// using direct "Switch to Desktop N" shortcut if enabled for Desktop Spaces, otherwise stepping with Move Left/Right.
     /// Set `settleForLaunch: false` for fast interactive hotkey switching.
     @discardableResult
     func switchDisplay(_ displayUUID: String, toSpaceIndex targetIndex: Int, settleForLaunch: Bool = true) -> Bool {
@@ -155,12 +167,13 @@ final class WindowController {
 
         let allDisplays = inspector.listDisplays()
         guard let initialDisplay = allDisplays.first(where: { $0.uuid == displayUUID }),
-              targetIndex >= 0, targetIndex < initialDisplay.desktopSpaceIds.count else {
+              targetIndex >= 0, targetIndex < initialDisplay.spaces.count else {
             SpaceBootLogger.log("switchDisplay invalid display=\(displayUUID) targetIndex=\(targetIndex)")
             return false
         }
 
-        let targetSpaceId = initialDisplay.desktopSpaceIds[targetIndex]
+        let targetSpace = initialDisplay.spaces[targetIndex]
+        let targetSpaceId = targetSpace.id
         // ⌥N switches skip refocusing when cursor and keyboard focus already sit on this display (the usual case
         // when flipping through one monitor's Spaces), so the Space shortcut goes out the moment ⌥N is pressed.
         if settleForLaunch || !displayHasInputFocus(initialDisplay) {
@@ -186,9 +199,9 @@ final class WindowController {
         let stepSettleMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceAnimationSettleMicros : SpaceBootConfig.interactiveSettleMicros
         let pollMicros: useconds_t = settleForLaunch ? SpaceBootConfig.spaceSwitchPollMicros : SpaceBootConfig.interactivePollMicros
 
-        // Fast path: if the user enabled "Switch to Desktop N" in System Settings, jump directly in 1 hop
-        // (no stepping through intermediate spaces, no focus dependency).
-        if let globalIdx = globalDesktopIndex(displayUUID: displayUUID, localIndex: targetIndex, in: allDisplays),
+        // Fast path: if the target is a Desktop Space and the user enabled "Switch to Desktop N", jump directly in 1 hop.
+        if targetSpace.kind == .desktop,
+           let globalIdx = globalDesktopIndex(displayUUID: displayUUID, spaceId: targetSpaceId, in: allDisplays),
            let directShortcut = hotKeys.directDesktopShortcut(globalIndex: globalIdx) {
             SpaceBootLogger.log("switchDisplay \(initialDisplay.name) direct jump -> global Desktop \(globalIdx + 1) (id=\(targetSpaceId))")
             let prevId = initialDisplay.currentSpaceId
@@ -227,7 +240,7 @@ final class WindowController {
             }
         }
 
-        let maxSteps = initialDisplay.desktopSpaceIds.count + 2
+        let maxSteps = initialDisplay.spaces.count + 2
         for step in 0..<maxSteps {
             guard let live = inspector.listDisplays().first(where: { $0.uuid == displayUUID }) else {
                 return false
@@ -273,7 +286,7 @@ final class WindowController {
     @discardableResult
     func switchDisplay(_ displayUUID: String, toSpaceId spaceId: Int, settleForLaunch: Bool = true) -> Bool {
         guard let display = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
-              let index = display.desktopSpaceIds.firstIndex(of: spaceId) else {
+              let index = display.spaces.firstIndex(where: { $0.id == spaceId }) else {
             SpaceBootLogger.log("switchDisplay: Space id=\(spaceId) no longer exists on display \(displayUUID)")
             return false
         }
@@ -293,8 +306,8 @@ final class WindowController {
     @discardableResult
     func revealSpace(ofWindow windowId: Int) -> Bool {
         let spaceIds = inspector.spaceIds(forWindow: windowId)
-        guard let display = inspector.listDisplays().first(where: { d in spaceIds.contains(where: d.desktopSpaceIds.contains) }),
-              let spaceId = spaceIds.first(where: display.desktopSpaceIds.contains) else {
+        guard let display = inspector.listDisplays().first(where: { d in spaceIds.contains(where: d.allSpaceIds.contains) }),
+              let spaceId = spaceIds.first(where: display.allSpaceIds.contains) else {
             return false
         }
         return ensureSpaceVisible(displayUUID: display.uuid, spaceId: spaceId)
@@ -482,13 +495,342 @@ final class WindowController {
         AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
     }
 
+    // MARK: - Fullscreen & Split View Control
+
+    /// Transitions `windowId` into a solo native macOS Fullscreen Space on `displayUUID` and returns the new Space ID.
+    func enterFullScreen(windowId: Int, pid: pid_t, onDisplay displayUUID: String) -> Int? {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+        guard AXIsProcessTrusted() else { return nil }
+
+        if let existing = inspector.fullScreenSpace(hostingWindow: windowId) {
+            if existing.display.uuid == displayUUID && existing.space.kind == .fullscreen {
+                return existing.space.id
+            }
+            guard exitFullScreen(windowId: windowId, pid: pid) else { return nil }
+        }
+
+        if let display = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+           let win = inspector.listAllUserWindows().first(where: { $0.windowId == windowId }) {
+            let onTargetDisplay = win.spaceIds.contains(where: display.desktopSpaceIds.contains)
+            if !onTargetDisplay, let stagingId = display.desktopSpaceIds.last {
+                let stageFrame = WindowRect(
+                    x: Int(display.cgFrame.minX + 60),
+                    y: Int(display.cgFrame.minY + 60),
+                    width: min(win.frame.width, Int(max(500, display.cgFrame.width - 120))),
+                    height: min(win.frame.height, Int(max(400, display.cgFrame.height - 120)))
+                )
+                guard relocateWindow(windowId: windowId, pid: pid, frame: stageFrame, targetDisplayUUID: displayUUID, targetSpaceId: stagingId) else {
+                    return nil
+                }
+            }
+        }
+
+        _ = revealSpace(ofWindow: windowId)
+        raiseWindow(windowId: windowId, pid: pid)
+        usleep(140_000)
+
+        guard let axWindow = findAXWindow(windowId: windowId, pid: pid) else {
+            SpaceBootLogger.log("FullScreen: AXWindow not found for wid=\(windowId)")
+            return nil
+        }
+
+        // Tier 1: set AXFullScreen = true directly.
+        if AXUIElementSetAttributeValue(axWindow, "AXFullScreen" as CFString, kCFBooleanTrue) == .success {
+            if let sid = waitForFullScreenSpace(windowId: windowId, onDisplay: displayUUID, timeout: 2.5) {
+                usleep(450_000)
+                SpaceBootLogger.log("FullScreen: wid=\(windowId) entered sp=\(sid) via AXFullScreen")
+                return sid
+            }
+        }
+
+        // Tier 2: press the green fullscreen button.
+        if let fsButton = copyAXElementAttr(axWindow, kAXFullScreenButtonAttribute),
+           AXUIElementPerformAction(fsButton, kAXPressAction as CFString) == .success {
+            if let sid = waitForFullScreenSpace(windowId: windowId, onDisplay: displayUUID, timeout: 2.5) {
+                usleep(450_000)
+                SpaceBootLogger.log("FullScreen: wid=\(windowId) entered sp=\(sid) via AXFullScreenButton")
+                return sid
+            }
+        }
+
+        // Tier 3: press localized "Enter Full Screen" menu item in AXMenuBar.
+        if triggerEnterFullScreenMenuItem(pid: pid) {
+            if let sid = waitForFullScreenSpace(windowId: windowId, onDisplay: displayUUID, timeout: 3.0) {
+                usleep(450_000)
+                SpaceBootLogger.log("FullScreen: wid=\(windowId) entered sp=\(sid) via AXMenuBar")
+                return sid
+            }
+        }
+
+        SpaceBootLogger.log("FullScreen: failed to enter fullscreen for wid=\(windowId)")
+        return nil
+    }
+
+    /// Exits native Fullscreen / Split View for `windowId` back onto a Desktop Space.
+    @discardableResult
+    func exitFullScreen(windowId: Int, pid: pid_t) -> Bool {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+        guard AXIsProcessTrusted() else { return false }
+
+        guard inspector.fullScreenSpace(hostingWindow: windowId) != nil else { return true }
+        _ = revealSpace(ofWindow: windowId)
+        raiseWindow(windowId: windowId, pid: pid)
+        usleep(150_000)
+
+        guard let axWindow = findAXWindow(windowId: windowId, pid: pid) else { return false }
+
+        if AXUIElementSetAttributeValue(axWindow, "AXFullScreen" as CFString, kCFBooleanFalse) == .success,
+           waitForFullScreenExit(windowId: windowId, timeout: 3.5) {
+            usleep(450_000)
+            return true
+        }
+        if let fsButton = copyAXElementAttr(axWindow, kAXFullScreenButtonAttribute),
+           AXUIElementPerformAction(fsButton, kAXPressAction as CFString) == .success,
+           waitForFullScreenExit(windowId: windowId, timeout: 3.5) {
+            usleep(450_000)
+            return true
+        }
+        if triggerExitFullScreenMenuItem(pid: pid),
+           waitForFullScreenExit(windowId: windowId, timeout: 3.5) {
+            usleep(450_000)
+            return true
+        }
+        return inspector.fullScreenSpace(hostingWindow: windowId) == nil
+    }
+
+    /// Pairs two windows into native macOS Fullscreen Split View on `displayUUID` and adjusts the vertical divider to `splitRatio`.
+    func enterSplitView(
+        leftWindowId: Int,
+        leftPid: pid_t,
+        rightWindowId: Int,
+        rightPid: pid_t,
+        onDisplay displayUUID: String,
+        splitRatio: Double?
+    ) -> Int? {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+        guard AXIsProcessTrusted() else { return nil }
+
+        // Already paired in a Split View Space on the target display?
+        if let existing = inspector.fullScreenSpace(hostingWindow: leftWindowId),
+           existing.display.uuid == displayUUID,
+           existing.space.kind == .split,
+           existing.space.tiles.contains(where: { $0.windowId == rightWindowId }) {
+            if let ratio = splitRatio {
+                _ = adjustSplitDivider(spaceId: existing.space.id, onDisplay: displayUUID, targetRatio: ratio)
+            }
+            return existing.space.id
+        }
+
+        // Ensure neither window is locked inside a separate Fullscreen Space.
+        if inspector.fullScreenSpace(hostingWindow: leftWindowId) != nil {
+            guard exitFullScreen(windowId: leftWindowId, pid: leftPid) else { return nil }
+        }
+        if inspector.fullScreenSpace(hostingWindow: rightWindowId) != nil {
+            guard exitFullScreen(windowId: rightWindowId, pid: rightPid) else { return nil }
+        }
+
+        guard let display = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+              let stagingDesktopId = (display.currentSpace?.kind == .desktop ? display.currentSpaceId : display.desktopSpaceIds.last) else {
+            SpaceBootLogger.log("SplitView: no Desktop Space available on \(displayUUID) to stage split")
+            return nil
+        }
+
+        let halfW = max(500, Int(display.cgFrame.width / 2) - 40)
+        let stageH = max(400, Int(display.cgFrame.height) - 100)
+        let leftStageFrame = WindowRect(x: Int(display.cgFrame.minX + 20), y: Int(display.cgFrame.minY + 40), width: halfW, height: stageH)
+        let rightStageFrame = WindowRect(x: Int(display.cgFrame.minX) + halfW + 40, y: Int(display.cgFrame.minY + 40), width: halfW, height: stageH)
+
+        if !inspector.spaceIds(forWindow: rightWindowId).contains(stagingDesktopId) {
+            guard relocateWindow(windowId: rightWindowId, pid: rightPid, frame: rightStageFrame, targetDisplayUUID: displayUUID, targetSpaceId: stagingDesktopId) else {
+                return nil
+            }
+        }
+        if !inspector.spaceIds(forWindow: leftWindowId).contains(stagingDesktopId) {
+            guard relocateWindow(windowId: leftWindowId, pid: leftPid, frame: leftStageFrame, targetDisplayUUID: displayUUID, targetSpaceId: stagingDesktopId) else {
+                return nil
+            }
+        }
+
+        guard ensureSpaceVisible(displayUUID: displayUUID, spaceId: stagingDesktopId) else { return nil }
+        usleep(150_000)
+
+        // Raise right window first, then left window so both sit together on the visible Desktop with left focused.
+        raiseWindow(windowId: rightWindowId, pid: rightPid)
+        usleep(120_000)
+        raiseWindow(windowId: leftWindowId, pid: leftPid)
+        usleep(180_000)
+
+        guard triggerTileLeftFullScreen(windowId: leftWindowId, pid: leftPid) else {
+            SpaceBootLogger.log("SplitView: failed to trigger Full Screen Tile Left on wid=\(leftWindowId)")
+            return nil
+        }
+
+        // Wait for macOS to create the fullscreen tile space and show the Split View right-side picker.
+        let pickerDeadline = Date().addingTimeInterval(SpaceBootConfig.splitPickerAppearTimeoutSeconds)
+        var pickerSpace: (display: LiveDisplayInfo, space: LiveSpaceInfo)?
+        while Date() < pickerDeadline {
+            if let fs = inspector.fullScreenSpace(hostingWindow: leftWindowId), fs.display.uuid == displayUUID {
+                if fs.space.kind == .split && fs.space.tiles.contains(where: { $0.windowId == rightWindowId }) {
+                    if let ratio = splitRatio {
+                        _ = adjustSplitDivider(spaceId: fs.space.id, onDisplay: displayUUID, targetRatio: ratio)
+                    }
+                    return fs.space.id
+                }
+                if let leftTile = fs.space.tiles.first(where: { $0.windowId == leftWindowId }),
+                   Double(leftTile.tileRect.width) < fs.display.cgFrame.width * 0.85 {
+                    pickerSpace = fs
+                    break
+                }
+            }
+            usleep(100_000)
+        }
+
+        guard let picker = pickerSpace,
+              let leftTile = picker.space.tiles.first(where: { $0.windowId == leftWindowId }) else {
+            SpaceBootLogger.log("SplitView: timed out waiting for Split View picker on wid=\(leftWindowId)")
+            return nil
+        }
+
+        // Let the picker thumbnail animation finish before locating & clicking the right-hand candidate.
+        usleep(450_000)
+        let leftRightEdgeX = picker.display.cgFrame.minX + Double(leftTile.tileRect.x + leftTile.tileRect.width)
+
+        for clickAttempt in 1...2 {
+            var candidateBounds = inspector.onscreenWindowBounds(windowId: rightWindowId)
+            if candidateBounds == nil || !picker.display.cgFrame.contains(CGPoint(x: candidateBounds!.midX, y: candidateBounds!.midY)) || candidateBounds!.midX <= leftRightEdgeX {
+                usleep(250_000)
+                candidateBounds = inspector.onscreenWindowBounds(windowId: rightWindowId)
+            }
+
+            guard let bounds = candidateBounds,
+                  picker.display.cgFrame.contains(CGPoint(x: bounds.midX, y: bounds.midY)),
+                  bounds.midX > leftRightEdgeX else {
+                let dump = inspector.listOnscreenUserWindows()
+                    .filter { picker.display.cgFrame.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY)) }
+                    .map { "wid=\($0.windowId)(\($0.appName)):\($0.rect)" }
+                    .joined(separator: ", ")
+                SpaceBootLogger.log("SplitPicker: wid=\(rightWindowId) not found in right half (leftEdge=\(Int(leftRightEdgeX)), bounds=\(String(describing: candidateBounds))). Onscreen: [\(dump)]")
+                continue
+            }
+
+            let clickPt = CGPoint(x: bounds.midX, y: bounds.midY)
+            SpaceBootLogger.log("SplitPicker: attempt \(clickAttempt) clicking wid=\(rightWindowId) at \(clickPt) (bounds=\(bounds))")
+            clickPoint(clickPt)
+
+            let pairDeadline = Date().addingTimeInterval(3.5)
+            while Date() < pairDeadline {
+                if let fs = inspector.fullScreenSpace(hostingWindow: leftWindowId),
+                   fs.display.uuid == displayUUID,
+                   fs.space.kind == .split,
+                   fs.space.tiles.contains(where: { $0.windowId == rightWindowId }) {
+                    usleep(500_000)
+                    SpaceBootLogger.log("SplitView: paired wid=\(leftWindowId) + wid=\(rightWindowId) on sp=\(fs.space.id) (ratio=\(fs.space.splitRatio ?? -1))")
+                    if let ratio = splitRatio {
+                        _ = adjustSplitDivider(spaceId: fs.space.id, onDisplay: displayUUID, targetRatio: ratio)
+                    }
+                    return fs.space.id
+                }
+                usleep(120_000)
+            }
+        }
+
+        // If still stuck in the Split View picker, press Escape so macOS exits picker cleanly.
+        if let fs = inspector.fullScreenSpace(hostingWindow: leftWindowId),
+           fs.space.kind == .fullscreen,
+           let leftTile = fs.space.tiles.first(where: { $0.windowId == leftWindowId }),
+           Double(leftTile.tileRect.width) < fs.display.cgFrame.width * 0.85 {
+            postShortcut(KeyShortcut(keyCode: 53, flags: []))
+            usleep(300_000)
+        }
+        SpaceBootLogger.log("SplitView: failed to pair wid=\(leftWindowId) + wid=\(rightWindowId)")
+        return nil
+    }
+
+    /// Drags the Split View vertical divider bar to `targetRatio` (left tile width fraction).
+    @discardableResult
+    func adjustSplitDivider(spaceId: Int, onDisplay displayUUID: String, targetRatio rawTargetRatio: Double) -> Bool {
+        spaceLock.lock()
+        defer { spaceLock.unlock() }
+        guard AXIsProcessTrusted() else { return false }
+
+        let targetRatio = min(max(rawTargetRatio, 0.15), 0.85)
+        guard let initialDisplay = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+              let initialSpace = initialDisplay.spaces.first(where: { $0.id == spaceId }),
+              initialSpace.kind == .split,
+              initialSpace.tiles.count >= 2,
+              let initialRatio = initialSpace.splitRatio else {
+            return false
+        }
+
+        if abs(initialRatio - targetRatio) <= SpaceBootConfig.splitRatioTolerance {
+            return true
+        }
+
+        guard ensureSpaceVisible(displayUUID: displayUUID, spaceId: spaceId) else { return false }
+        usleep(150_000)
+
+        var previousAfterRatio: Double?
+        for attempt in 1...2 {
+            guard let liveDisplay = inspector.listDisplays().first(where: { $0.uuid == displayUUID }),
+                  let liveSpace = liveDisplay.spaces.first(where: { $0.id == spaceId }),
+                  liveSpace.kind == .split,
+                  liveSpace.tiles.count >= 2,
+                  let currentRatio = liveSpace.splitRatio else {
+                return false
+            }
+            if abs(currentRatio - targetRatio) <= SpaceBootConfig.splitRatioTolerance {
+                return true
+            }
+
+            let layoutRect = liveSpace.layoutRect ?? WindowRect(
+                x: 0,
+                y: 0,
+                width: Int(liveDisplay.cgFrame.width),
+                height: Int(liveDisplay.cgFrame.height)
+            )
+            let spacing = Double(liveSpace.interTileSpacing > 0 ? liveSpace.interTileSpacing : 12)
+            let usableWidth = Double(layoutRect.width) - spacing
+            let leftTile = liveSpace.tiles[0]
+
+            let startX = liveDisplay.cgFrame.minX + Double(leftTile.tileRect.x + leftTile.tileRect.width) + spacing / 2.0
+            let rawTargetX = liveDisplay.cgFrame.minX + Double(layoutRect.x) + usableWidth * targetRatio + spacing / 2.0
+            let targetX = min(max(rawTargetX, liveDisplay.cgFrame.minX + 120), liveDisplay.cgFrame.maxX - 120)
+            let midY = liveDisplay.cgFrame.minY + liveDisplay.cgFrame.height * 0.5
+
+            dragMouse(from: CGPoint(x: startX, y: midY), to: CGPoint(x: targetX, y: midY))
+            usleep(450_000)
+
+            let afterRatio = inspector.listDisplays()
+                .first(where: { $0.uuid == displayUUID })?
+                .spaces.first(where: { $0.id == spaceId })?
+                .splitRatio
+            SpaceBootLogger.log("SplitDivider attempt \(attempt) sp=\(spaceId): \(currentRatio) -> \(afterRatio ?? -1) (want \(targetRatio))")
+
+            if let after = afterRatio {
+                if abs(after - targetRatio) <= SpaceBootConfig.splitRatioTolerance {
+                    return true
+                }
+                if let prev = previousAfterRatio, abs(prev - after) < 0.002 {
+                    SpaceBootLogger.log("SplitDivider clamped by OS/app at \(after) (want \(targetRatio))")
+                    return true
+                }
+                previousAfterRatio = after
+            }
+        }
+        return false
+    }
+
     // MARK: - Private Helpers
 
-    private func globalDesktopIndex(displayUUID: String, localIndex: Int, in displays: [LiveDisplayInfo]) -> Int? {
+    private func globalDesktopIndex(displayUUID: String, spaceId: Int, in displays: [LiveDisplayInfo]) -> Int? {
         var offset = 0
         for d in displays {
             if d.uuid == displayUUID {
-                return offset + localIndex
+                guard let localIdx = d.desktopSpaceIds.firstIndex(of: spaceId) else { return nil }
+                return offset + localIdx
             }
             offset += d.desktopSpaceIds.count
         }
@@ -547,6 +889,262 @@ final class WindowController {
             return nil
         }
         return ref as? String
+    }
+
+    private func copyAXElementAttr(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &ref) == .success,
+              let value = ref else {
+            return nil
+        }
+        return (value as! AXUIElement)
+    }
+
+    private func waitForFullScreenSpace(windowId: Int, onDisplay displayUUID: String, timeout: TimeInterval) -> Int? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let fs = inspector.fullScreenSpace(hostingWindow: windowId),
+               fs.display.uuid == displayUUID {
+                return fs.space.id
+            }
+            usleep(100_000)
+        }
+        return nil
+    }
+
+    private func waitForFullScreenExit(windowId: Int, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if inspector.fullScreenSpace(hostingWindow: windowId) == nil &&
+               !inspector.spaceIds(forWindow: windowId).isEmpty {
+                return true
+            }
+            usleep(100_000)
+        }
+        return false
+    }
+
+    private func triggerEnterFullScreenMenuItem(pid: pid_t) -> Bool {
+        let titles: Set<String> = [
+            "enter full screen",
+            "进入全屏幕",
+            "進入全螢幕",
+            "フルスクリーンにする",
+            "vollbild ein",
+            "activer le mode plein écran",
+            "usar pantalla completa"
+        ]
+        return pressMatchingMenuItem(pid: pid) { title, _ in
+            titles.contains(title)
+        }
+    }
+
+    private func triggerExitFullScreenMenuItem(pid: pid_t) -> Bool {
+        let titles: Set<String> = [
+            "exit full screen",
+            "退出全屏幕",
+            "離開全螢幕",
+            "フルスクリーンを解除",
+            "vollbild aus",
+            "quitter le mode plein écran",
+            "salir de pantalla completa"
+        ]
+        return pressMatchingMenuItem(pid: pid) { title, _ in
+            titles.contains(title)
+        }
+    }
+
+    private func triggerTileLeftFullScreen(windowId: Int, pid: pid_t) -> Bool {
+        // Tier 1: Search the app's AXMenuBar Window menu for macOS 14 ("Tile Window to Left of Screen")
+        // or macOS 15+ ("Window -> Full Screen Tile -> Left of Screen").
+        let pressedMenuBar = pressMatchingMenuItem(pid: pid) { title, parentTitle in
+            isFullScreenLeftTileMenuItem(title: title, parentTitle: parentTitle)
+        }
+        if pressedMenuBar {
+            return true
+        }
+
+        // Tier 2: AXShowMenu on the window's green AXFullScreenButton.
+        guard let axWindow = findAXWindow(windowId: windowId, pid: pid),
+              let fsButton = copyAXElementAttr(axWindow, kAXFullScreenButtonAttribute) else {
+            return false
+        }
+        guard AXUIElementPerformAction(fsButton, kAXShowMenuAction as CFString) == .success else {
+            return false
+        }
+        usleep(250_000)
+
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(fsButton, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let menus = childrenRef as? [AXUIElement] {
+            for menu in menus {
+                if searchAndPressMenu(menu, parentTitle: "", predicate: isFullScreenLeftTileMenuItem) {
+                    return true
+                }
+            }
+        }
+
+        // Dismiss the green-button popup menu if nothing matched.
+        postShortcut(KeyShortcut(keyCode: 53, flags: []))
+        return false
+    }
+
+    private func isFullScreenLeftTileMenuItem(title: String, parentTitle: String) -> Bool {
+        let legacyTitles: Set<String> = [
+            "tile window to left of screen",
+            "将窗口拼贴到屏幕左侧",
+            "將視窗並排顯示於螢幕左側",
+            "ウインドウを画面の左側にタイル表示",
+            "fenster links auf dem bildschirm anordnen",
+            "juxtaposer la fenêtre à gauche de l’écran",
+            "colocar ventana a la izquierda de la pantalla"
+        ]
+        if legacyTitles.contains(title) {
+            return true
+        }
+        if (title.contains("tile") || title.contains("拼贴") || title.contains("並排")) &&
+           (title.contains("left") || title.contains("左")) {
+            return true
+        }
+
+        // macOS 15+: Window -> Full Screen Tile -> Left of Screen (exclude Move & Resize -> Left).
+        let isLeftOfScreen = [
+            "left of screen",
+            "屏幕左侧",
+            "螢幕左側",
+            "画面の左側",
+            "linke bildschirmhälfte",
+            "à gauche de l’écran",
+            "izquierda de la pantalla"
+        ].contains { title.contains($0) }
+
+        let underFullScreenParent = [
+            "full screen",
+            "fullscreen",
+            "全屏",
+            "全螢幕",
+            "フルスクリーン",
+            "vollbild",
+            "plein écran",
+            "pantalla completa"
+        ].contains { parentTitle.contains($0) }
+
+        return isLeftOfScreen && underFullScreenParent
+    }
+
+    private func pressMatchingMenuItem(pid: pid_t, predicate: (String, String) -> Bool) -> Bool {
+        let appElement = AXUIElementCreateApplication(pid)
+        var mbRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXMenuBarAttribute as CFString, &mbRef) == .success,
+              let menuBar = mbRef else {
+            return false
+        }
+        var topRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &topRef) == .success,
+              let topItems = topRef as? [AXUIElement] else {
+            return false
+        }
+
+        for topItem in topItems.dropFirst(2) {
+            let topTitle = normalizeMenuTitle(copyStringAttr(topItem, kAXTitleAttribute) ?? "")
+            var subRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(topItem, kAXChildrenAttribute as CFString, &subRef) == .success,
+                  let subMenus = subRef as? [AXUIElement],
+                  let menu = subMenus.first else {
+                continue
+            }
+            if searchAndPressMenu(menu, parentTitle: topTitle, predicate: predicate) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func searchAndPressMenu(_ menu: AXUIElement, parentTitle: String, predicate: (String, String) -> Bool) -> Bool {
+        var itemsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(menu, kAXChildrenAttribute as CFString, &itemsRef) == .success,
+              let items = itemsRef as? [AXUIElement] else {
+            return false
+        }
+        for item in items {
+            let rawTitle = copyStringAttr(item, kAXTitleAttribute) ?? ""
+            let normalized = normalizeMenuTitle(rawTitle)
+            if !normalized.isEmpty && isAXElementEnabled(item) && predicate(normalized, parentTitle) {
+                let err = AXUIElementPerformAction(item, kAXPressAction as CFString)
+                SpaceBootLogger.log("Menu AXPress '\(rawTitle)' (parent='\(parentTitle)') -> err=\(err.rawValue)")
+                if err == .success {
+                    return true
+                }
+            }
+            var subRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(item, kAXChildrenAttribute as CFString, &subRef) == .success,
+               let subMenus = subRef as? [AXUIElement] {
+                for subMenu in subMenus {
+                    if searchAndPressMenu(subMenu, parentTitle: normalized.isEmpty ? parentTitle : normalized, predicate: predicate) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    private func normalizeMenuTitle(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "…", with: "")
+            .replacingOccurrences(of: "...", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private func isAXElementEnabled(_ element: AXUIElement) -> Bool {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &ref) == .success else {
+            return true
+        }
+        return (ref as? Bool) ?? true
+    }
+
+    private func clickPoint(_ point: CGPoint) {
+        moveMouse(to: point)
+        usleep(80_000)
+        let source = CGEventSource(stateID: .hidSystemState)
+        if let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+           let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) {
+            down.post(tap: .cghidEventTap)
+            usleep(40_000)
+            up.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func dragMouse(from start: CGPoint, to end: CGPoint) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        moveMouse(to: start)
+        usleep(80_000)
+
+        guard let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left) else {
+            return
+        }
+        down.post(tap: .cghidEventTap)
+        usleep(120_000)
+
+        let steps = 16
+        for i in 1...steps {
+            let t = Double(i) / Double(steps)
+            let pt = CGPoint(
+                x: start.x + (end.x - start.x) * t,
+                y: start.y + (end.y - start.y) * t
+            )
+            if let drag = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: pt, mouseButton: .left) {
+                drag.post(tap: .cghidEventTap)
+            }
+            usleep(18_000)
+        }
+
+        usleep(100_000)
+        if let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: end, mouseButton: .left) {
+            up.post(tap: .cghidEventTap)
+        }
     }
 
     private func logFilterOnce(_ windowId: Int, _ message: String) {

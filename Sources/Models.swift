@@ -15,6 +15,11 @@ enum SpaceBootConfig {
     static let splashFilterMinHeight = 350
     static let normalWindowLayer = 0
     static let desktopSpaceType = 0
+    static let fullscreenSpaceType = 4
+
+    static let fullscreenTransitionTimeoutSeconds: TimeInterval = 4.0
+    static let splitPickerAppearTimeoutSeconds: TimeInterval = 3.5
+    static let splitRatioTolerance: Double = 0.025
 
     static let spaceSwitchTimeoutSeconds: TimeInterval = 2.0
     static let spaceSwitchPollMicros: useconds_t = 80_000
@@ -125,10 +130,22 @@ struct WindowRecord: Codable {
     var launch: LaunchConfig?
 }
 
+enum SpaceKind: String, Codable, Equatable {
+    case desktop
+    case fullscreen
+    case split
+}
+
 struct SpaceLayout: Codable {
-    /// 0-based Desktop index on this display (excluding fullscreen spaces).
+    /// 0-based order of this Space on this display (across Desktop, Fullscreen, and Split View Spaces).
     var spaceIndex: Int
+    /// Nil in legacy profiles (treated as `.desktop`).
+    var kind: SpaceKind? = nil
+    /// For `.split`: left window width fraction of total tiled width (e.g. 0.5, 0.65).
+    var splitRatio: Double? = nil
     var windows: [WindowRecord]
+
+    var effectiveKind: SpaceKind { kind ?? .desktop }
 }
 
 struct DisplayLayout: Codable {
@@ -138,9 +155,18 @@ struct DisplayLayout: Codable {
     var activeSpaceIndex: Int
     var spaces: [SpaceLayout]
 
-    /// Number of Desktop Spaces actually required to host all recorded non-empty spaces on this display.
+    /// Number of Desktop Spaces actually required to host all recorded non-empty Desktop spaces on this display.
+    var requiredDesktopSpaceCount: Int {
+        let nonEmptyDesktops = spaces.filter { $0.effectiveKind == .desktop && !$0.windows.isEmpty }
+        if spaces.allSatisfy({ $0.effectiveKind == .desktop }) {
+            return nonEmptyDesktops.map { $0.spaceIndex + 1 }.max() ?? 0
+        }
+        return nonEmptyDesktops.count
+    }
+
+    /// Total non-empty Spaces recorded on this display (Desktop + Fullscreen + Split).
     var requiredSpaceCount: Int {
-        spaces.filter { !$0.windows.isEmpty }.map { $0.spaceIndex + 1 }.max() ?? 0
+        spaces.filter { !$0.windows.isEmpty }.count
     }
 }
 
@@ -165,17 +191,43 @@ struct SpaceBootProfile: Codable {
 
 // MARK: - Live Runtime Snapshot Models
 
+struct LiveTileInfo {
+    let windowId: Int
+    let pid: pid_t
+    let tileSpaceId: Int
+    let tileType: String
+    let tileRect: WindowRect
+}
+
+struct LiveSpaceInfo {
+    let id: Int
+    let kind: SpaceKind
+    /// Empty for `.desktop`; 1 tile for `.fullscreen`; 2 tiles sorted left-to-right by `tileRect.x` for `.split`.
+    let tiles: [LiveTileInfo]
+    let layoutRect: WindowRect?
+    let interTileSpacing: Int
+
+    var splitRatio: Double? {
+        guard kind == .split, tiles.count >= 2 else { return nil }
+        let totalWidth = Double(tiles[0].tileRect.width + tiles[1].tileRect.width)
+        guard totalWidth > 0 else { return nil }
+        return (Double(tiles[0].tileRect.width) / totalWidth * 1000.0).rounded() / 1000.0
+    }
+}
+
 struct LiveDisplayInfo {
     let uuid: String
     let name: String
     let cgFrame: CGRect
-    /// Ordered normal desktop space IDs (type == 0), left-to-right.
-    let desktopSpaceIds: [Int]
+    /// All managed Spaces (`.desktop`, `.fullscreen`, `.split`) in Mission Control left-to-right order.
+    let spaces: [LiveSpaceInfo]
     let currentSpaceId: Int
 
-    var currentSpaceIndex: Int? {
-        desktopSpaceIds.firstIndex(of: currentSpaceId)
-    }
+    var allSpaceIds: [Int] { spaces.map(\.id) }
+    var desktopSpaceIds: [Int] { spaces.filter { $0.kind == .desktop }.map(\.id) }
+    var currentSpace: LiveSpaceInfo? { spaces.first { $0.id == currentSpaceId } }
+    var currentSpaceIndex: Int? { spaces.firstIndex { $0.id == currentSpaceId } }
+    var currentDesktopIndex: Int? { desktopSpaceIds.firstIndex(of: currentSpaceId) }
 
     var cgCenter: CGPoint {
         CGPoint(x: cgFrame.midX, y: cgFrame.midY)
@@ -189,9 +241,10 @@ struct AXWindowMeta {
     let isSizeSettable: Bool
     let isPositionSettable: Bool
     let isMinimized: Bool
+    let isFullScreen: Bool
 
     var isStandardMainWindow: Bool {
-        role == "AXWindow" && subrole == "AXStandardWindow" && !isMinimized
+        role == "AXWindow" && (subrole == "AXStandardWindow" || isFullScreen) && !isMinimized
     }
 }
 

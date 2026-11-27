@@ -45,7 +45,8 @@ final class SpaceInspector {
         copyManagedDisplaySpaces != nil && copySpacesForWindows != nil
     }
 
-    /// Returns all currently connected displays with their exact native Desktop Space list.
+    /// Returns all currently connected displays with their exact native Spaces (Desktop, Fullscreen, Split View)
+    /// in Mission Control left-to-right order.
     func listDisplays() -> [LiveDisplayInfo] {
         guard let copyManaged = copyManagedDisplaySpaces else { return [] }
         let rawDisplays = copyManaged(connectionId) as? [[String: Any]] ?? []
@@ -55,19 +56,25 @@ final class SpaceInspector {
         for entry in rawDisplays {
             guard let uuid = entry["Display Identifier"] as? String else { continue }
             let rawSpaces = entry["Spaces"] as? [[String: Any]] ?? []
-            let desktopSpaceIds = rawSpaces.compactMap { space -> Int? in
-                let type = space["type"] as? Int ?? -1
-                guard type == SpaceBootConfig.desktopSpaceType else { return nil }
-                return space["id64"] as? Int
-            }
             let currentSpaceId = (entry["Current Space"] as? [String: Any])?["id64"] as? Int ?? 0
-
             let screenInfo = screenMap[uuid]
+            let displayFrame = screenInfo?.cgFrame ?? .zero
+
+            let spaces = rawSpaces.compactMap { space -> LiveSpaceInfo? in
+                guard let id64 = space["id64"] as? Int else { return nil }
+                let type = space["type"] as? Int ?? -1
+                if type == SpaceBootConfig.desktopSpaceType {
+                    return LiveSpaceInfo(id: id64, kind: .desktop, tiles: [], layoutRect: nil, interTileSpacing: 0)
+                }
+                guard type == SpaceBootConfig.fullscreenSpaceType else { return nil }
+                return parseFullScreenSpace(space, spaceId: id64, displayFrame: displayFrame)
+            }
+
             results.append(LiveDisplayInfo(
                 uuid: uuid,
                 name: screenInfo?.name ?? uuid,
-                cgFrame: screenInfo?.cgFrame ?? .zero,
-                desktopSpaceIds: desktopSpaceIds,
+                cgFrame: displayFrame,
+                spaces: spaces,
                 currentSpaceId: currentSpaceId
             ))
         }
@@ -86,6 +93,7 @@ final class SpaceInspector {
         let displays = listDisplays()
         let activeSpaceIds = Set(displays.map { $0.currentSpaceId })
         let openSpaceLookup = buildOpenWindowSpaceMap(displays: displays)
+        let tileSpaceMap = buildTileWindowSpaceMap(displays: displays)
         let pidInfo = buildPidAppInfoMap()
 
         var windows: [LiveWindowInfo] = []
@@ -111,12 +119,14 @@ final class SpaceInspector {
                 height: Int((bounds["Height"] as? Double ?? 0).rounded())
             )
 
-            // Prefer SLSCopyWindowsWithOptionsAndTags(options: 0x0) which excludes closed (Cmd+W),
-            // minimized (Cmd+M), and hidden windows even on inactive Spaces.
+            // Prefer SLSCopyWindowsWithOptionsAndTags(options: 0x0) for Desktop Spaces and direct TileSpaces mapping
+            // for Fullscreen/Split Spaces (excluding closed, minimized, hidden, and fullscreen backdrop windows).
             let spaceIds: [Int]
             if let lookup = openSpaceLookup {
                 guard let matchedSpaces = lookup[wid], !matchedSpaces.isEmpty else { continue }
                 spaceIds = matchedSpaces
+            } else if let tileSpaces = tileSpaceMap[wid], !tileSpaces.isEmpty {
+                spaceIds = tileSpaces
             } else {
                 let fallbackSpaces = copyWinSpaces(connectionId, 0x7, [wid] as CFArray) as? [Int] ?? []
                 guard !fallbackSpaces.isEmpty else { continue }
@@ -159,21 +169,161 @@ final class SpaceInspector {
         return liveDisplays.first(where: { $0.name == saved.displayName })
     }
 
+    /// Returns the live Fullscreen or Split View Space currently hosting `windowId`, if any.
+    func fullScreenSpace(hostingWindow windowId: Int, in displays: [LiveDisplayInfo]? = nil) -> (display: LiveDisplayInfo, space: LiveSpaceInfo)? {
+        let list = displays ?? listDisplays()
+        for display in list {
+            for space in display.spaces where space.kind != .desktop {
+                if space.tiles.contains(where: { $0.windowId == windowId }) {
+                    return (display, space)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Returns the live on-screen bounds for `windowId` (e.g., its picker thumbnail during Split View selection).
+    func onscreenWindowBounds(windowId: Int) -> CGRect? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let rawList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        for entry in rawList {
+            guard (entry[kCGWindowNumber as String] as? Int) == windowId,
+                  let bounds = entry[kCGWindowBounds as String] as? [String: Any] else { continue }
+            let x = bounds["X"] as? Double ?? 0
+            let y = bounds["Y"] as? Double ?? 0
+            let w = bounds["Width"] as? Double ?? 0
+            let h = bounds["Height"] as? Double ?? 0
+            if w > 0 && h > 0 {
+                return CGRect(x: x, y: y, width: w, height: h)
+            }
+        }
+        return nil
+    }
+
+    /// Diagnostic helper returning currently onscreen layer-0 user windows and their live CG frames.
+    func listOnscreenUserWindows() -> [(windowId: Int, pid: pid_t, appName: String, rect: CGRect)] {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let rawList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        let pidInfo = buildPidAppInfoMap()
+        var results: [(Int, pid_t, String, CGRect)] = []
+        for entry in rawList {
+            guard isUserWindowEntry(entry, pidInfo: pidInfo),
+                  let wid = entry[kCGWindowNumber as String] as? Int,
+                  let pidInt = entry[kCGWindowOwnerPID as String] as? Int else { continue }
+            let bounds = entry[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            let rect = CGRect(
+                x: bounds["X"] as? Double ?? 0,
+                y: bounds["Y"] as? Double ?? 0,
+                width: bounds["Width"] as? Double ?? 0,
+                height: bounds["Height"] as? Double ?? 0
+            )
+            let owner = entry[kCGWindowOwnerName as String] as? String ?? ""
+            results.append((wid, pid_t(pidInt), owner, rect))
+        }
+        return results
+    }
+
     // MARK: - Private Helpers
 
-    /// Maps each genuinely open (unminimized, non-hidden, non-closed) windowId -> [desktopSpaceId].
+    private func parseFullScreenSpace(_ space: [String: Any], spaceId: Int, displayFrame: CGRect) -> LiveSpaceInfo? {
+        let manager = space["TileLayoutManager"] as? [String: Any]
+        let layoutRect = (manager?["Layout Rect"] as? [String: Any]).flatMap(parseWindowRect)
+        let spacingWidth = ((manager?["Inter-Tile Spacing"] as? [String: Any])?["Width"] as? NSNumber)?.doubleValue ?? 12.0
+        let interTileSpacing = Int(spacingWidth.rounded())
+
+        var tiles: [LiveTileInfo] = []
+        if let rawTiles = manager?["TileSpaces"] as? [[String: Any]] {
+            for tile in rawTiles {
+                let wid = (tile["TileWindowID"] as? Int) ?? (tile["fs_wid"] as? Int) ?? 0
+                let pidInt = tile["pid"] as? Int ?? 0
+                guard wid > 0 else { continue }
+                let tileSpaceId = tile["id64"] as? Int ?? spaceId
+                let tileType = tile["TileType"] as? String ?? "Primary"
+                let rect = (tile["TileRect"] as? [String: Any]).flatMap(parseWindowRect)
+                    ?? layoutRect
+                    ?? WindowRect(x: 0, y: 0, width: Int(displayFrame.width), height: Int(displayFrame.height))
+                tiles.append(LiveTileInfo(
+                    windowId: wid,
+                    pid: pid_t(pidInt),
+                    tileSpaceId: tileSpaceId,
+                    tileType: tileType,
+                    tileRect: rect
+                ))
+            }
+        }
+
+        if tiles.isEmpty, let wid = space["fs_wid"] as? Int, wid > 0 {
+            let pidInt = space["pid"] as? Int ?? 0
+            let fallbackRect = WindowRect(x: 0, y: 0, width: Int(displayFrame.width), height: Int(displayFrame.height))
+            tiles.append(LiveTileInfo(
+                windowId: wid,
+                pid: pid_t(pidInt),
+                tileSpaceId: spaceId,
+                tileType: "Primary",
+                tileRect: fallbackRect
+            ))
+        }
+
+        guard !tiles.isEmpty else { return nil }
+        tiles.sort {
+            if $0.tileRect.x != $1.tileRect.x { return $0.tileRect.x < $1.tileRect.x }
+            return $0.tileType == "Primary" && $1.tileType != "Primary"
+        }
+
+        let kind: SpaceKind = tiles.count >= 2 ? .split : .fullscreen
+        return LiveSpaceInfo(
+            id: spaceId,
+            kind: kind,
+            tiles: tiles,
+            layoutRect: layoutRect,
+            interTileSpacing: interTileSpacing
+        )
+    }
+
+    private func parseWindowRect(_ dict: [String: Any]) -> WindowRect? {
+        guard let x = (dict["X"] as? NSNumber)?.doubleValue,
+              let y = (dict["Y"] as? NSNumber)?.doubleValue,
+              let w = (dict["Width"] as? NSNumber)?.doubleValue,
+              let h = (dict["Height"] as? NSNumber)?.doubleValue else {
+            return nil
+        }
+        return WindowRect(
+            x: Int(x.rounded()),
+            y: Int(y.rounded()),
+            width: Int(w.rounded()),
+            height: Int(h.rounded())
+        )
+    }
+
+    private func buildTileWindowSpaceMap(displays: [LiveDisplayInfo]) -> [Int: [Int]] {
+        var map: [Int: [Int]] = [:]
+        for display in displays {
+            for space in display.spaces where space.kind != .desktop {
+                for tile in space.tiles {
+                    map[tile.windowId, default: []].append(space.id)
+                }
+            }
+        }
+        return map
+    }
+
+    /// Maps each genuinely open (unminimized, non-hidden, non-closed) windowId -> [spaceId] across Desktop and Fullscreen/Split Spaces.
     private func buildOpenWindowSpaceMap(displays: [LiveDisplayInfo]) -> [Int: [Int]]? {
         guard let copyWithOpts = copyWindowsWithOptionsAndTags else { return nil }
-        var map: [Int: [Int]] = [:]
+        var map = buildTileWindowSpaceMap(displays: displays)
 
         for display in displays {
-            for spaceId in display.desktopSpaceIds {
+            for space in display.spaces where space.kind == .desktop {
                 var setTags: UInt64 = 0
                 var clearTags: UInt64 = 0
-                // options = 0x0 excludes minimized, hidden, and closed background windows on that Space.
-                let rawIds = copyWithOpts(connectionId, 0, [spaceId] as CFArray, 0x0, &setTags, &clearTags) as? [Int] ?? []
+                // options = 0x0 excludes minimized, hidden, and closed background windows on that Desktop Space.
+                let rawIds = copyWithOpts(connectionId, 0, [space.id] as CFArray, 0x0, &setTags, &clearTags) as? [Int] ?? []
                 for wid in rawIds {
-                    map[wid, default: []].append(spaceId)
+                    map[wid, default: []].append(space.id)
                 }
             }
         }

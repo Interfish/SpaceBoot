@@ -223,13 +223,15 @@ final class AppLauncher {
             }
         }
 
-        // Pass 1: Exact localized "New Window" match (handles Chrome Cmd+N, Cursor/VS Code Cmd+Shift+N, Safari, Finder, etc.).
+        // Pass 1: Exact localized "New Window" match (handles Chrome Cmd+N, Cursor/VS Code Cmd+Shift+N, Safari, Finder, Terminal, etc.).
         if let exact = menuItems.first(where: { entry in
             let normalized = normalizeMenuTitle(entry.title)
             return Self.exactNewWindowTitles.contains(normalized) && !containsExcludedKeyword(normalized)
         }) {
-            let err = AXUIElementPerformAction(exact.element, kAXPressAction as CFString)
-            SpaceBootLogger.log("AppLauncher: AXPress menu '\(exact.title)' on \(appName) -> err=\(err.rawValue)")
+            let targetElement = resolveLeafMenuItem(exact.element)
+            let targetTitle = copyAXString(targetElement, kAXTitleAttribute) ?? exact.title
+            let err = AXUIElementPerformAction(targetElement, kAXPressAction as CFString)
+            SpaceBootLogger.log("AppLauncher: AXPress menu '\(targetTitle)' on \(appName) -> err=\(err.rawValue)")
             return err == .success
         }
 
@@ -262,6 +264,19 @@ final class AppLauncher {
             return []
         }
         return items
+    }
+
+    /// If a menu item (like Terminal.app's `Shell -> New Window`) opens a submenu of profiles,
+    /// resolves the submenu's Cmd+N item or first enabled leaf item so AXPress actually opens a window.
+    private func resolveLeafMenuItem(_ item: AXUIElement) -> AXUIElement {
+        let subItems = directMenuItems(of: item).filter {
+            isAXElementEnabled($0) && !(copyAXString($0, kAXTitleAttribute) ?? "").isEmpty
+        }
+        guard !subItems.isEmpty else { return item }
+        let cmdN = subItems.first {
+            (copyAXString($0, kAXMenuItemCmdCharAttribute) ?? "").caseInsensitiveCompare("N") == .orderedSame
+        }
+        return resolveLeafMenuItem(cmdN ?? subItems[0])
     }
 
     private func normalizeMenuTitle(_ raw: String) -> String {

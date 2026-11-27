@@ -77,8 +77,8 @@ final class ProfileManager {
 
     // MARK: - Record (Zero-Switch Snapshot of All Displays & Spaces)
 
-    /// Records every display's non-empty Spaces. Recorded Space indices skip empty Desktops, so `liveSlots` maps
-    /// each recorded Space to the live Desktop it currently is (to apply the profile's ⌥ order right away).
+    /// Records every display's non-empty Spaces (Desktop, Fullscreen, and Split View) in Mission Control order.
+    /// Empty Desktop Spaces are skipped, so `liveSlots` maps each recorded Space to its live Space index.
     /// The profile's `hotkeyOrder` keeps its previous order on re-record, else starts from `liveHotkeyOrder`.
     func recordProfile(
         named name: String,
@@ -90,28 +90,11 @@ final class ProfileManager {
         let existingProfile = loadProfile(named: name)
         let liveDisplays = inspector.listDisplays()
         let allWindows = inspector.listAllUserWindows()
-
-        var spaceLookup: [Int: (displayIdx: Int, spaceIdx: Int)] = [:]
-        for (dIdx, display) in liveDisplays.enumerated() {
-            for (sIdx, spaceId) in display.desktopSpaceIds.enumerated() {
-                spaceLookup[spaceId] = (dIdx, sIdx)
-            }
-        }
-
-        var buckets: [[Int: [LiveWindowInfo]]] = Array(repeating: [:], count: liveDisplays.count)
-        for win in allWindows {
-            guard let matchedSpace = win.spaceIds.compactMap({ spaceLookup[$0] }).first else {
-                continue
-            }
-            guard controller.isRecordableWindow(win) else {
-                continue
-            }
-            buckets[matchedSpace.displayIdx][matchedSpace.spaceIdx, default: []].append(win)
-        }
+        let windowsById = Dictionary(allWindows.map { ($0.windowId, $0) }, uniquingKeysWith: { first, _ in first })
 
         var displayLayouts: [DisplayLayout] = []
         var liveSlots: [SpaceSlotKey: SpaceSlotKey] = [:]
-        for (dIdx, display) in liveDisplays.enumerated() {
+        for display in liveDisplays {
             let priorDisplay = existingProfile?.displays.first(where: {
                 $0.displayUUID == display.uuid || $0.displayName == display.name
             })
@@ -120,10 +103,33 @@ final class ProfileManager {
             var remappedActiveSpaceIndex = 0
             let liveActiveIndex = display.currentSpaceIndex ?? 0
 
-            for sIdx in 0..<display.desktopSpaceIds.count {
-                let rawWins = buckets[dIdx][sIdx] ?? []
-                // Skip empty Spaces so recorded profiles never require blank placeholder desktops.
-                guard !rawWins.isEmpty else { continue }
+            for (sIdx, liveSpace) in display.spaces.enumerated() {
+                let rawWins: [LiveWindowInfo]
+                let effectiveKind: SpaceKind
+                let recordedSplitRatio: Double?
+
+                switch liveSpace.kind {
+                case .desktop:
+                    rawWins = allWindows.filter {
+                        $0.spaceIds.contains(liveSpace.id) && controller.isRecordableWindow($0, isFullScreenSpace: false)
+                    }
+                    guard !rawWins.isEmpty else { continue }
+                    effectiveKind = .desktop
+                    recordedSplitRatio = nil
+
+                case .fullscreen, .split:
+                    let tileWins = liveSpace.tiles.compactMap { tile -> LiveWindowInfo? in
+                        guard let win = windowsById[tile.windowId],
+                              controller.isRecordableWindow(win, isFullScreenSpace: true) else {
+                            return nil
+                        }
+                        return win
+                    }
+                    guard !tileWins.isEmpty else { continue }
+                    rawWins = tileWins
+                    effectiveKind = tileWins.count >= 2 ? .split : .fullscreen
+                    recordedSplitRatio = effectiveKind == .split ? liveSpace.splitRatio : nil
+                }
 
                 let compactedIdx = spaceLayouts.count
                 if sIdx == liveActiveIndex {
@@ -132,8 +138,12 @@ final class ProfileManager {
                 liveSlots[SpaceSlotKey(displayUUID: display.uuid, spaceIndex: compactedIdx)] =
                     SpaceSlotKey(displayUUID: display.uuid, spaceIndex: sIdx)
 
-                let priorSpace = priorDisplay?.spaces.first(where: { $0.spaceIndex == compactedIdx })
-                    ?? priorDisplay?.spaces.first(where: { $0.spaceIndex == sIdx })
+                let recordedAppIds = Set(rawWins.map(\.appId))
+                let priorSpace = priorDisplay?.spaces.first(where: { $0.spaceIndex == compactedIdx && $0.effectiveKind == effectiveKind })
+                    ?? priorDisplay?.spaces.first(where: { $0.spaceIndex == sIdx && $0.effectiveKind == effectiveKind })
+                    ?? priorDisplay?.spaces.first(where: {
+                        $0.effectiveKind == effectiveKind && !Set($0.windows.map(\.appId)).isDisjoint(with: recordedAppIds)
+                    })
                 var usedPriorIndices: Set<Int> = []
 
                 let records: [WindowRecord] = rawWins.enumerated().map { zIdx, win in
@@ -159,7 +169,12 @@ final class ProfileManager {
                     )
                 }
 
-                spaceLayouts.append(SpaceLayout(spaceIndex: compactedIdx, windows: records))
+                spaceLayouts.append(SpaceLayout(
+                    spaceIndex: compactedIdx,
+                    kind: effectiveKind,
+                    splitRatio: recordedSplitRatio,
+                    windows: records
+                ))
             }
 
             displayLayouts.append(DisplayLayout(
@@ -185,17 +200,49 @@ final class ProfileManager {
         return (profile, liveSlots)
     }
 
-    /// Where each recorded Space of a booted profile lives: recorded Space i is Desktop i of the matching display.
+    /// Maps each recorded Space of a booted profile to its live Space index on the matching display.
     /// Empty if the profile has no saved ⌥ order, so booting it leaves the current order alone.
     func bootedLiveSlots(for profile: SpaceBootProfile) -> [SpaceSlotKey: SpaceSlotKey] {
         guard profile.hotkeyOrder != nil else { return [:] }
         let liveDisplays = inspector.listDisplays()
         var liveSlots: [SpaceSlotKey: SpaceSlotKey] = [:]
-        for key in profile.spaceSlotKeys {
-            guard let saved = profile.displays.first(where: { $0.displayUUID == key.displayUUID }),
-                  let live = inspector.matchLiveDisplay(for: saved, in: liveDisplays),
-                  key.spaceIndex < live.desktopSpaceIds.count else { continue }
-            liveSlots[key] = SpaceSlotKey(displayUUID: live.uuid, spaceIndex: key.spaceIndex)
+
+        for saved in profile.displays {
+            guard let live = inspector.matchLiveDisplay(for: saved, in: liveDisplays) else { continue }
+            let liveDesktopIndices = live.spaces.indices.filter { live.spaces[$0].kind == .desktop }
+            var usedLiveIndices: Set<Int> = []
+            var desktopRank = 0
+
+            for space in saved.spaces where !space.windows.isEmpty {
+                let recordedKey = SpaceSlotKey(displayUUID: saved.displayUUID, spaceIndex: space.spaceIndex)
+                switch space.effectiveKind {
+                case .desktop:
+                    if desktopRank < liveDesktopIndices.count {
+                        let liveIdx = liveDesktopIndices[desktopRank]
+                        liveSlots[recordedKey] = SpaceSlotKey(displayUUID: live.uuid, spaceIndex: liveIdx)
+                        usedLiveIndices.insert(liveIdx)
+                    }
+                    desktopRank += 1
+
+                case .fullscreen, .split:
+                    let expectedApps = Set(space.windows.map(\.appId))
+                    let matchedIdx = live.spaces.indices.first(where: { idx in
+                        guard !usedLiveIndices.contains(idx), live.spaces[idx].kind == space.effectiveKind else { return false }
+                        let tileApps = Set(live.spaces[idx].tiles.compactMap {
+                            NSRunningApplication(processIdentifier: $0.pid)?.bundleIdentifier
+                        })
+                        return tileApps == expectedApps || !tileApps.isDisjoint(with: expectedApps)
+                    }) ?? live.spaces.indices.first(where: {
+                        !usedLiveIndices.contains($0) && live.spaces[$0].kind == space.effectiveKind
+                    })
+                    if let idx = matchedIdx {
+                        liveSlots[recordedKey] = SpaceSlotKey(displayUUID: live.uuid, spaceIndex: idx)
+                        usedLiveIndices.insert(idx)
+                    } else if space.spaceIndex < live.spaces.count {
+                        liveSlots[recordedKey] = SpaceSlotKey(displayUUID: live.uuid, spaceIndex: space.spaceIndex)
+                    }
+                }
+            }
         }
         return liveSlots
     }
@@ -206,11 +253,16 @@ final class ProfileManager {
         SpaceBootLogger.log("=== INSPECT axTrusted=\(AXIsProcessTrusted()) ===")
         let displays = inspector.listDisplays()
         for d in displays {
-            SpaceBootLogger.log("Display \(d.name) uuid=\(d.uuid) cgFrame=\(d.cgFrame) spaces=\(d.desktopSpaceIds) current=\(d.currentSpaceId)")
+            let spaceDesc = d.spaces.map { sp -> String in
+                let ratioText = sp.splitRatio.map { String(format: " ratio=%.3f", $0) } ?? ""
+                let tileText = sp.tiles.isEmpty ? "" : " tiles=[" + sp.tiles.map { "wid=\($0.windowId) pid=\($0.pid) rect=\($0.tileRect)" }.joined(separator: ", ") + "]"
+                return "{id=\(sp.id) \(sp.kind.rawValue)\(ratioText)\(tileText)}"
+            }.joined(separator: ", ")
+            SpaceBootLogger.log("Display \(d.name) uuid=\(d.uuid) cgFrame=\(d.cgFrame) current=\(d.currentSpaceId) spaces=[\(spaceDesc)]")
         }
         for w in inspector.listAllUserWindows() {
             let meta = controller.inspectAXWindow(windowId: w.windowId, pid: w.pid)
-            let metaDesc = meta.map { "role=\($0.role) subrole=\($0.subrole) resizable=\($0.isSizeSettable) title='\($0.title.prefix(30))'" } ?? "ax=unavailable"
+            let metaDesc = meta.map { "role=\($0.role) subrole=\($0.subrole) fs=\($0.isFullScreen) resizable=\($0.isSizeSettable) title='\($0.title.prefix(30))'" } ?? "ax=unavailable"
             SpaceBootLogger.log("  wid=\(w.windowId) \(w.appId) (\(w.appName)) sp=\(w.spaceIds) frame=\(w.frame) \(metaDesc)")
         }
     }
@@ -245,18 +297,23 @@ final class ProfileManager {
 
         var insufficient: [(String, Int, Int)] = []
         for pair in displayPairs {
-            let required = pair.saved.requiredSpaceCount
-            if pair.live.desktopSpaceIds.count < required {
-                insufficient.append((pair.saved.displayName, pair.live.desktopSpaceIds.count, required))
+            let requiredDesktops = pair.saved.requiredDesktopSpaceCount
+            let hasAnyNonEmpty = pair.saved.spaces.contains { !$0.windows.isEmpty }
+            let neededDesktops = hasAnyNonEmpty ? max(1, requiredDesktops) : requiredDesktops
+            if pair.live.desktopSpaceIds.count < neededDesktops {
+                insufficient.append((pair.saved.displayName, pair.live.desktopSpaceIds.count, neededDesktops))
             }
         }
         if !insufficient.isEmpty {
             throw ProfileActionError.insufficientSpaces(insufficient)
         }
 
-        let needsSpaceSwitch = displayPairs.contains { pair in
+        let hasFullScreen = displayPairs.contains { pair in
+            pair.saved.spaces.contains { $0.effectiveKind != .desktop && !$0.windows.isEmpty }
+        }
+        let needsSpaceSwitch = hasFullScreen || displayPairs.contains { pair in
             pair.saved.spaces.filter { !$0.windows.isEmpty }.count > 1 ||
-            pair.saved.spaces.contains { !$0.windows.isEmpty && $0.spaceIndex != (pair.live.currentSpaceIndex ?? -1) }
+            pair.saved.spaces.contains { !$0.windows.isEmpty && $0.spaceIndex != (pair.live.currentDesktopIndex ?? -1) }
         }
         if needsSpaceSwitch {
             let hotKeys = SymbolicHotKeys()
